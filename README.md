@@ -26,7 +26,7 @@ three best, and books the one you click.
 
 Two rules the code enforces rather than merely intends:
 
-**The model handles language; Python handles decisions.** Claude parses requests
+**The model handles language; Python handles decisions.** The model parses requests
 and writes the copy. It never decides whether a diet is satisfied, whether an order
 is under budget, or when to spend money. That is `brain.py` — pure, tested Python.
 
@@ -38,8 +38,8 @@ On allergens: Swiggy menu data has no allergen field. Filtering runs on the
 structured veg/egg/jain tags and each person's own blocked keywords, and the bot
 says exactly that rather than claiming anything is safe.
 
-There is no MCP client here. The Anthropic MCP connector talks to
-`mcp.swiggy.com` server-side; we pass the host account's OAuth token and Claude
+There is no MCP client here. OpenAI's Responses API hosted `mcp` tool talks to
+`mcp.swiggy.com` server-side; we pass the host account's OAuth token and the model
 calls all 35 Swiggy tools directly.
 
 ## Setup
@@ -95,7 +95,7 @@ usual per-meal budget. Diet is `veg`, `jain`, `egg`, or `nonveg`.
 | File | Responsibility |
 |---|---|
 | `brain.py` | The solver — diet, budget, repeat fatigue, taste memory. Pure |
-| `agent.py` | Claude over the MCP connector; local tool dispatch |
+| `agent.py` | GPT over the Responses API MCP tool; local tool dispatch |
 | `swiggy_auth.py` | OAuth 2.1 PKCE, dynamic client registration, auto-refresh |
 | `db.py` | SQLite — profiles, policy, history, ratings, par levels |
 | `lunch.py` | Group-lunch state machine |
