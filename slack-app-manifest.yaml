@@ -1,0 +1,31 @@
+display_information:
+  name: Canteen
+  description: Orders team lunch, restocks the pantry, and books tables via Swiggy.
+  background_color: "#fc8019"
+features:
+  bot_user:
+    display_name: Canteen
+    always_online: true
+  slash_commands:
+    - command: /canteen
+      description: Set up the office, policy, your diet, or start a lunch order
+      usage_hint: "now | me | setup <address_id> | policy <cap> | addresses"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+      - app_mentions:read
+      - im:history
+      - im:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
