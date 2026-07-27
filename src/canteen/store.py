@@ -1,0 +1,192 @@
+"""SQLite persistence. Every read and write to disk goes through this module.
+
+We deliberately hold almost nothing: Swiggy owns the cart and the orders,
+Gemini owns the conversation transcript. What is left is a token per person, a
+preference line, an interaction id, and any group flow currently running.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+
+# sqlite3 connections cannot be used from a thread other than the one that
+# created them, and Slack Bolt runs every listener on a pool thread.
+_local = threading.local()
+
+SCHEMA = """
+create table if not exists swiggy_token (
+    user_id text primary key,
+    access_token text not null,
+    refresh_token text,
+    expires_at real not null
+);
+create table if not exists pending_auth (
+    user_id text primary key,
+    verifier text not null,
+    state text not null,
+    created_at real not null
+);
+create table if not exists preference (
+    user_id text primary key,
+    note text not null
+);
+create table if not exists conversation (
+    key text primary key,
+    interaction_id text not null,
+    updated_at real not null
+);
+create table if not exists group_order (
+    channel_id text primary key,
+    kind text not null,
+    host_user_id text not null,
+    message_ts text not null,
+    context text not null,
+    created_at real not null
+);
+"""
+
+
+def connect(path: str | None = None) -> sqlite3.Connection:
+    """The connection for the calling thread, opened on first use."""
+    target = path or os.environ.get("CANTEEN_DB", "canteen.db")
+    if getattr(_local, "path", None) == target:
+        return _local.conn
+    conn = sqlite3.connect(target)
+    conn.row_factory = sqlite3.Row
+    _local.conn = conn
+    _local.path = target
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
+# --- tokens, one per Slack user ---
+
+def save_token(conn, user_id: str, access_token: str, refresh_token: str | None,
+               expires_at: float) -> None:
+    conn.execute(
+        "insert into swiggy_token (user_id, access_token, refresh_token, expires_at) "
+        "values (?, ?, ?, ?) on conflict(user_id) do update set "
+        "access_token=excluded.access_token, refresh_token=excluded.refresh_token, "
+        "expires_at=excluded.expires_at",
+        (user_id, access_token, refresh_token, expires_at),
+    )
+    conn.commit()
+
+
+def get_token(conn, user_id: str) -> dict | None:
+    row = conn.execute("select * from swiggy_token where user_id = ?",
+                       (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_token(conn, user_id: str) -> None:
+    conn.execute("delete from swiggy_token where user_id = ?", (user_id,))
+    conn.commit()
+
+
+# --- in-flight authorisations ---
+
+def save_pending(conn, user_id: str, verifier: str, state: str,
+                 created_at: float) -> None:
+    conn.execute(
+        "insert into pending_auth (user_id, verifier, state, created_at) "
+        "values (?, ?, ?, ?) on conflict(user_id) do update set "
+        "verifier=excluded.verifier, state=excluded.state, "
+        "created_at=excluded.created_at",
+        (user_id, verifier, state, created_at),
+    )
+    conn.commit()
+
+
+def take_pending(conn, user_id: str) -> dict | None:
+    """Read and delete in one go — an auth code may only be redeemed once."""
+    row = conn.execute("select * from pending_auth where user_id = ?",
+                       (user_id,)).fetchone()
+    if not row:
+        return None
+    conn.execute("delete from pending_auth where user_id = ?", (user_id,))
+    conn.commit()
+    return dict(row)
+
+
+# --- preferences ---
+
+def set_preference(conn, user_id: str, note: str) -> None:
+    conn.execute(
+        "insert into preference (user_id, note) values (?, ?) "
+        "on conflict(user_id) do update set note=excluded.note",
+        (user_id, note),
+    )
+    conn.commit()
+
+
+def get_preference(conn, user_id: str) -> str | None:
+    row = conn.execute("select note from preference where user_id = ?",
+                       (user_id,)).fetchone()
+    return row["note"] if row else None
+
+
+# --- Gemini conversation continuity ---
+
+def set_interaction(conn, key: str, interaction_id: str, updated_at: float) -> None:
+    conn.execute(
+        "insert into conversation (key, interaction_id, updated_at) values (?, ?, ?) "
+        "on conflict(key) do update set interaction_id=excluded.interaction_id, "
+        "updated_at=excluded.updated_at",
+        (key, interaction_id, updated_at),
+    )
+    conn.commit()
+
+
+def get_interaction(conn, key: str) -> str | None:
+    row = conn.execute("select interaction_id from conversation where key = ?",
+                       (key,)).fetchone()
+    return row["interaction_id"] if row else None
+
+
+def clear_interaction(conn, key: str) -> None:
+    conn.execute("delete from conversation where key = ?", (key,))
+    conn.commit()
+
+
+# --- group flows ---
+
+def save_group(conn, channel_id: str, kind: str, host_user_id: str,
+               message_ts: str, context: dict, created_at: float) -> None:
+    conn.execute(
+        "insert into group_order (channel_id, kind, host_user_id, message_ts, "
+        "context, created_at) values (?, ?, ?, ?, ?, ?) "
+        "on conflict(channel_id) do update set kind=excluded.kind, "
+        "host_user_id=excluded.host_user_id, message_ts=excluded.message_ts, "
+        "context=excluded.context, created_at=excluded.created_at",
+        (channel_id, kind, host_user_id, message_ts, json.dumps(context), created_at),
+    )
+    conn.commit()
+
+
+def get_group(conn, channel_id: str) -> dict | None:
+    row = conn.execute("select * from group_order where channel_id = ?",
+                       (channel_id,)).fetchone()
+    if not row:
+        return None
+    out = dict(row)
+    out["context"] = json.loads(out["context"])
+    return out
+
+
+def set_group_context(conn, channel_id: str, context: dict) -> None:
+    conn.execute("update group_order set context = ? where channel_id = ?",
+                 (json.dumps(context), channel_id))
+    conn.commit()
+
+
+def delete_group(conn, channel_id: str) -> None:
+    conn.execute("delete from group_order where channel_id = ?", (channel_id,))
+    conn.commit()
