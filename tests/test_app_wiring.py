@@ -153,3 +153,60 @@ def test_every_local_tool_claude_can_call_is_actually_dispatchable():
     ctx = app.local_ctx(CHANNEL)
     declared = {t["name"] for t in app.agent.LOCAL_TOOLS}
     assert declared == set(ctx), declared.symmetric_difference(set(ctx))
+
+
+class FakeClient:
+    """Records what the handler would have sent to Slack."""
+
+    def __init__(self):
+        self.sent = []
+
+    def chat_postMessage(self, **kw):
+        self.sent.append(kw)
+        return {"ts": "1.1"}
+
+
+def test_admin_reply_leaves_plain_language_alone():
+    """Returning None is what routes a message to the model instead."""
+    for text in ("what's good for lunch?", "book a table for six",
+                 "setup", "policy loads", "par"):
+        assert app.admin_reply(text, CHANNEL, "U1", FakeClient()) is None, text
+
+
+def test_admin_reply_handles_the_setup_commands():
+    client = FakeClient()
+    assert "Office saved" in app.admin_reply("setup addr-1", CHANNEL, "U1", client)
+    assert db.get_office(app.store(), CHANNEL)["address_id"] == "addr-1"
+    assert "250" in app.admin_reply("policy 250", CHANNEL, "U1", client)
+    assert db.get_policy(app.store(), CHANNEL)["per_head_cap"] == 250
+
+
+def test_an_empty_mention_gets_help():
+    assert app.admin_reply("", CHANNEL, "U1", FakeClient()) == app.HELP
+
+
+def test_the_bot_handle_is_stripped_before_the_command_is_read():
+    assert app.MENTION.sub("", "<@U09CANTEEN> setup addr-1").strip() == "setup addr-1"
+
+
+def test_save_profile_keeps_what_the_new_line_did_not_mention():
+    """Reported bug: any later DM reset diet to nonveg and dropped the
+    blocklist. A new line should add to a profile, not replace it."""
+    db.upsert_profile(app.store(), "U1", "veg", ["mushroom"], 250)
+
+    app.save_profile("U1", "no paneer")
+
+    saved = db.get_profile(app.store(), "U1")
+    assert saved["diet"] == "veg"                       # not reset
+    assert saved["blocklist"] == ["mushroom", "paneer"]  # added, not replaced
+    assert saved["budget"] == 250                        # kept
+
+
+def test_save_profile_states_the_diet_it_stored():
+    db.upsert_profile(app.store(), "U1", "veg", [], None)
+    assert "*veg*" in app.save_profile("U1", "no okra")
+
+
+def test_a_new_person_who_only_names_a_dislike_gets_the_permissive_default():
+    assert "nonveg" in app.save_profile("U-NEW", "no okra")
+    assert db.get_profile(app.store(), "U-NEW")["blocklist"] == ["okra"]

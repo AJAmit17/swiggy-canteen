@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -24,7 +25,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from canteen import agent, blocks, db, dineout, lunch, pantry, swiggy_auth
 from canteen.brain import Participant, Rejection, eatable_dishes, solve
-from canteen.parsing import close_time, parse_profile, to_candidates
+from canteen.parsing import (close_time, looks_like_profile, parse_profile,
+                             to_candidates)
+from canteen.slackfmt import to_mrkdwn
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -158,8 +161,47 @@ def local_ctx(channel_id: str) -> dict:
 
 def ask(channel_id: str, prompt: str, servers: list[str],
         extra_system: str | None = None) -> str:
-    return agent.run(gemini, prompt=prompt, token=token(), servers=servers,
-                     ctx=local_ctx(channel_id), extra_system=extra_system)
+    """Every model reply reaches Slack through here, so mrkdwn conversion does
+    too. Models write CommonMark; Slack renders `**bold**` as literal asterisks."""
+    return to_mrkdwn(
+        agent.run(gemini, prompt=prompt, token=token(), servers=servers,
+                  ctx=local_ctx(channel_id), extra_system=extra_system)
+    )
+
+
+THINKING = ":hourglass_flowing_sand: _Working on it…_"
+
+
+def progress(channel_id: str, thread_ts: str | None = None):
+    """Post a placeholder now; return a function that turns it into the answer.
+
+    A Swiggy round-trip takes ten to thirty seconds, and Slack shows nothing at
+    all while it runs — the channel just looks broken.
+    """
+    posted = app.client.chat_postMessage(
+        channel=channel_id, text=THINKING, thread_ts=thread_ts
+    )
+
+    def finish(text: str, block_kit: list | None = None) -> None:
+        app.client.chat_update(channel=channel_id, ts=posted["ts"],
+                               text=text, blocks=block_kit or [])
+
+    return finish
+
+
+def ask_visibly(channel_id: str, prompt: str, servers: list[str],
+                thread_ts: str | None = None) -> None:
+    """ask(), with the placeholder replaced by the answer — or by the failure.
+
+    The error is reported here rather than re-raised so the placeholder never
+    strands on "Working on it…" while the real message goes only to the log.
+    """
+    finish = progress(channel_id, thread_ts)
+    try:
+        finish(ask(channel_id, prompt, servers))
+    except Exception as exc:
+        log.exception("ask failed")
+        finish(f":warning: That didn't work: `{exc}`. Nothing was ordered.")
 
 
 # ---------------------------------------------------------------- lunch flow
@@ -298,6 +340,8 @@ def handle_place_order(ack, body, client):
         return
 
     items = ", ".join(i["name"] for i in state.cart.values())
+    client.chat_update(channel=channel_id, ts=state.message_ts, blocks=[],
+                       text=":hourglass_flowing_sand: _Placing the order…_")
     try:
         reply = ask(
             channel_id,
@@ -316,8 +360,8 @@ def handle_place_order(ack, body, client):
             "Do not place anything.",
             servers=["food"],
         )
-        client.chat_postMessage(
-            channel=channel_id,
+        client.chat_update(
+            channel=channel_id, ts=state.message_ts, blocks=[],
             text=(f"The order call failed (`{exc}`). I did *not* retry — that risks "
                   f"double-ordering. Latest order on the account:\n{status}"),
         )
@@ -369,21 +413,27 @@ def run_pantry_check(channel_id: str) -> None:
     par = db.par_levels(store())
     if not office or not par:
         return
-    ask(
-        channel_id,
-        f"For Instamart delivery address {office['address_id']}, call "
-        "your_go_to_items and then report every item through record_pantry_items "
-        "with its product_id, name and unit price in whole rupees.",
-        servers=["im"],
-    )
+    finish = progress(channel_id)
+    try:
+        ask(
+            channel_id,
+            f"For Instamart delivery address {office['address_id']}, call "
+            "your_go_to_items and then report every item through "
+            "record_pantry_items with its product_id, name and unit price in "
+            "whole rupees.",
+            servers=["im"],
+        )
+    except Exception as exc:
+        log.exception("pantry check failed")
+        finish(f":warning: Pantry check failed: `{exc}`. Nothing was ordered.")
+        return
     needed = PANTRY_DRAFT.get(channel_id) or []
     if not needed:
         log.info("pantry: nothing below par in %s", channel_id)
+        finish("Pantry's fine — everything is at or above par.")
         return
-    app.client.chat_postMessage(
-        channel=channel_id, text="Pantry restock",
-        blocks=blocks.pantry_approval(needed, pantry.restock_total(needed)),
-    )
+    finish("Pantry restock",
+           blocks.pantry_approval(needed, pantry.restock_total(needed)))
 
 
 @app.action("approve_pantry")
@@ -397,6 +447,7 @@ def handle_approve_pantry(ack, body, client):
                                 text="That restock list has expired — re-run the check.")
         return
     lines = ", ".join(f"{i['name']} x{i['qty']}" for i in needed)
+    finish = progress(channel_id)
     try:
         reply = ask(
             channel_id,
@@ -409,13 +460,10 @@ def handle_approve_pantry(ack, body, client):
         status = ask(channel_id,
                      "List my most recent Instamart order with its id and status. "
                      "Do not check anything out.", servers=["im"])
-        client.chat_postMessage(
-            channel=channel_id,
-            text=(f"Checkout failed (`{exc}`). I did *not* retry. Latest order:\n{status}"),
-        )
+        finish(f"Checkout failed (`{exc}`). I did *not* retry. Latest order:\n{status}")
         return
     PANTRY_DRAFT.pop(channel_id, None)
-    client.chat_postMessage(channel=channel_id, text=reply)
+    finish(reply)
 
 
 @app.action("skip_pantry")
@@ -429,23 +477,27 @@ def handle_skip_pantry(ack, body, client):
 # ------------------------------------------------------------------- dineout
 
 def propose_tables(channel_id: str, request_text: str) -> None:
-    ask(
-        channel_id,
-        f"A team wants a restaurant table. Request: {request_text!r}. Use "
-        "search_restaurants_dineout and get_available_slots for the top candidates, "
-        "then report everything through record_dineout_slots — each restaurant with "
-        "id, name, rating and a slots array of slot_id, hour, time, capacity, "
-        "is_free. Infer party_size and preferred_hour from the request.",
-        servers=["dineout"],
-    )
+    finish = progress(channel_id)
+    try:
+        ask(
+            channel_id,
+            f"A team wants a restaurant table. Request: {request_text!r}. Use "
+            "search_restaurants_dineout and get_available_slots for the top "
+            "candidates, then report everything through record_dineout_slots — each "
+            "restaurant with id, name, rating and a slots array of slot_id, hour, "
+            "time, capacity, "
+            "is_free. Infer party_size and preferred_hour from the request.",
+            servers=["dineout"],
+        )
+    except Exception as exc:
+        log.exception("dineout search failed")
+        finish(f":warning: Table search failed: `{exc}`. Nothing was booked.")
+        return
     options = DINEOUT_DRAFT.get(channel_id) or []
     if not options:
-        app.client.chat_postMessage(
-            channel=channel_id,
-            text="No free tables matched that party size and time.")
+        finish("No free tables matched that party size and time.")
         return
-    app.client.chat_postMessage(channel=channel_id, text="Table options",
-                                blocks=blocks.dineout_options(options))
+    finish("Table options", blocks.dineout_options(options))
 
 
 @app.action("book_slot")
@@ -454,6 +506,7 @@ def handle_book_slot(ack, body, client):
     ack()
     channel_id = body["channel"]["id"]
     restaurant_id, slot_id = body["actions"][0]["value"].split("|", 1)
+    finish = progress(channel_id)
     try:
         reply = ask(
             channel_id,
@@ -463,71 +516,81 @@ def handle_book_slot(ack, body, client):
         )
     except Exception as exc:
         log.exception("booking failed")
-        client.chat_postMessage(
-            channel=channel_id,
-            text=f"Booking failed (`{exc}`). I did not retry — check Dineout directly.")
+        finish(f"Booking failed (`{exc}`). I did not retry — check Dineout directly.")
         return
     DINEOUT_DRAFT.pop(channel_id, None)
-    client.chat_postMessage(channel=channel_id, text=reply)
+    finish(reply)
 
 
 # ------------------------------------------------------- setup and onboarding
 
-@app.command("/canteen")
-def handle_command(ack, body, client, respond):
-    ack()
-    parts = (body.get("text") or "").split()
-    sub = parts[0] if parts else "help"
-    channel_id = body["channel_id"]
+HELP = (
+    "Mention me and say what you want — `@Canteen what's good for lunch?`, "
+    "`@Canteen book a table for six at 8pm`, `@Canteen check the pantry`.\n\n"
+    "Set-up commands:\n"
+    "`@Canteen setup <address_id> [tz] [HH:MM]` — link this channel to an office\n"
+    "`@Canteen policy <per_head_cap> [restaurant_id ...]` — spending policy\n"
+    "`@Canteen par <product_id> <name> <qty>` — pantry target quantity\n"
+    "`@Canteen now` — open a roll call · `@Canteen close` — order now\n"
+    "`@Canteen me` — set your diet · `@Canteen addresses` — list Swiggy addresses"
+)
+
+ADDRESS_PROMPT = "List my saved Swiggy delivery addresses with their ids."
+
+SKIP_WORDS = {"skip", "none", "nothing", "no restrictions", "anything"}
+
+MENTION = re.compile(r"<@[^>]+>")
+
+
+def admin_reply(text: str, channel_id: str, user_id: str, client) -> str | None:
+    """The set-up commands, shared by `@Canteen` and the legacy slash command.
+
+    Returns the text to post, `""` when the command posted its own message, or
+    None when this is not a command at all and should be treated as language.
+    """
+    parts = text.split()
+    sub = parts[0].lower() if parts else "help"
 
     if sub == "setup" and len(parts) >= 2:
         db.upsert_office(store(), channel_id, parts[1],
                          parts[2] if len(parts) > 2 else DEFAULT_TZ,
                          parts[3] if len(parts) > 3 else DEFAULT_ROLL_CALL)
-        respond("Office saved. Restart me to pick up the new roll-call schedule.")
-    elif sub == "policy" and len(parts) >= 2:
+        return "Office saved. Restart me to pick up the new roll-call schedule."
+    if sub == "policy" and len(parts) >= 2 and parts[1].isdigit():
         db.upsert_policy(store(), channel_id, int(parts[1]), parts[2:])
-        respond(f"Per-head cap ₹{parts[1]}. Allowlist: {parts[2:] or 'any vendor'}.")
-    elif sub == "par" and len(parts) >= 4:
+        return f"Per-head cap ₹{parts[1]}. Allowlist: {parts[2:] or 'any vendor'}."
+    if sub == "par" and len(parts) >= 4 and parts[-1].isdigit():
         db.set_par_level(store(), parts[1], " ".join(parts[2:-1]), int(parts[-1]))
-        respond("Par level saved.")
-    elif sub == "now":
+        return "Par level saved."
+    if sub == "now" and len(parts) == 1:
         start_roll_call(channel_id)
-        respond("Roll call open — tap in.")
-    elif sub == "close":
+        return ""
+    if sub == "close" and len(parts) == 1:
         close_roll_call(channel_id)
-    elif sub == "me":
-        _start_onboarding(body["user_id"], client)
-        respond("Sent you a DM.")
-    elif sub == "addresses":
-        respond(ask(channel_id, "List my saved Swiggy delivery addresses with ids.",
-                    servers=["food"]))
-    else:
-        respond(
-            "`/canteen setup <address_id> [tz] [HH:MM]` — link this channel to an office\n"
-            "`/canteen policy <per_head_cap> [restaurant_id ...]` — spending policy\n"
-            "`/canteen par <product_id> <name> <qty>` — pantry target quantity\n"
-            "`/canteen now` — open a roll call · `/canteen close` — order now\n"
-            "`/canteen me` — set your diet · `/canteen addresses` — list Swiggy addresses"
-        )
-
-
-ONBOARD_PROMPT = (
-    "Hi — I run lunch for the team.\n\n"
-    "Reply here with one line so I never pick something you can't eat, like:\n"
-    "`veg, no mushroom, 250` — diet, things to avoid, your usual per-meal budget.\n\n"
-    "Diet can be `veg`, `jain`, `egg` or `nonveg`."
-)
-
-
-def _start_onboarding(user_id: str, client) -> None:
-    client.chat_postMessage(channel=user_id, text=ONBOARD_PROMPT)
+        return ""
+    if sub == "me" and len(parts) == 1:
+        _start_onboarding(user_id, client)
+        return "Sent you a DM."
+    if sub == "help" or not parts:
+        return HELP
+    return None
 
 
 @app.event("app_mention")
-def handle_mention(body, say):
-    channel_id = body["event"]["channel"]
-    text = body["event"]["text"]
+def handle_mention(body, client):
+    """`@Canteen ...` — the main way in. Set-up commands and plain language."""
+    event = body["event"]
+    channel_id = event["channel"]
+    thread_ts = event.get("thread_ts")
+    text = MENTION.sub("", event.get("text", "")).strip()
+
+    reply = admin_reply(text, channel_id, event["user"], client)
+    if reply is not None:
+        if reply:
+            client.chat_postMessage(channel=channel_id, text=reply,
+                                    thread_ts=thread_ts)
+        return
+
     low = text.lower()
     if "lunch" in low and ("now" in low or "today" in low):
         start_roll_call(channel_id)
@@ -538,24 +601,116 @@ def handle_mention(body, say):
     if "pantry" in low or "restock" in low:
         run_pantry_check(channel_id)
         return
-    say(ask(channel_id, text, servers=["food", "im", "dineout"]))
+    if low.startswith("address"):
+        text = ADDRESS_PROMPT
+    ask_visibly(channel_id, text, servers=["food", "im", "dineout"],
+                thread_ts=thread_ts)
+
+
+@app.command("/canteen")
+def handle_command(ack, body, client, respond):
+    """Kept working for anyone with muscle memory; `@Canteen` is the real surface."""
+    ack()
+    text = (body.get("text") or "").strip()
+    channel_id = body["channel_id"]
+
+    reply = admin_reply(text, channel_id, body["user_id"], client)
+    if reply is not None:
+        if reply:
+            respond(reply)
+        return
+
+    respond(THINKING)
+    prompt = ADDRESS_PROMPT if text.lower().startswith("address") else text
+    try:
+        respond(text=ask(channel_id, prompt, servers=["food", "im", "dineout"]),
+                replace_original=True)
+    except Exception as exc:
+        log.exception("slash command failed")
+        respond(text=f":warning: That didn't work: `{exc}`. Nothing was ordered.",
+                replace_original=True)
+
+
+ONBOARD_PROMPT = (
+    "Hi — I run lunch for the team.\n\n"
+    "Reply here with one line so I never pick something you can't eat, like:\n"
+    "`veg, no mushroom, 250` — diet, things to avoid, your usual per-meal budget.\n\n"
+    "Diet can be `veg`, `jain`, `egg` or `nonveg`. "
+    "You can also just ask me things here — `what's good for lunch today?`"
+)
+
+# Who we have just sent the diet prompt to. Their next line is read as a
+# profile even if it is only "no mushroom"; after that they are back to normal
+# conversation. Losing this on restart costs one re-prompt, nothing more.
+ONBOARDING: set[str] = set()
+
+
+def _start_onboarding(user_id: str, client) -> None:
+    ONBOARDING.add(user_id)
+    client.chat_postMessage(channel=user_id, text=ONBOARD_PROMPT)
+
+
+def save_profile(user_id: str, text: str) -> str:
+    """Apply a diet line to a profile, keeping anything it did not mention."""
+    parsed = parse_profile(text)
+    existing = db.get_profile(store(), user_id) or {}
+    diet = parsed["diet"] or existing.get("diet") or db.DEFAULT_DIET
+    blocklist = sorted(set(existing.get("blocklist") or []) | set(parsed["blocklist"]))
+    budget = parsed["budget"] if parsed["budget"] is not None else existing.get("budget")
+    db.upsert_profile(store(), user_id, diet, blocklist, budget)
+
+    avoid = ", ".join(blocklist) or "nothing"
+    cap = f", budget ₹{budget}" if budget else ""
+    return (f"Got it — *{diet}*, avoiding {avoid}{cap}. "
+            "I'll filter every menu for you from now on.")
 
 
 @app.event("message")
-def handle_dm(body, client, logger):
-    """Onboarding replies arrive as DMs. Everything else is ignored."""
+def handle_dm(body, client):
+    """DMs are onboarding *and* conversation.
+
+    Reading every message as a diet line is what turned "yes please." into a
+    blocked dish and reset the sender to nonveg. A line is only a profile if it
+    unambiguously looks like one, or if we just asked for one.
+    """
     event = body.get("event", {})
-    if event.get("channel_type") != "im" or event.get("bot_id"):
+    if (event.get("channel_type") != "im" or event.get("bot_id")
+            or event.get("subtype")):
         return
-    profile = parse_profile(event.get("text", ""))
-    db.upsert_profile(store(), event["user"], profile["diet"],
-                      profile["blocklist"], profile["budget"])
-    avoid = ", ".join(profile["blocklist"]) or "nothing"
-    client.chat_postMessage(
-        channel=event["channel"],
-        text=(f"Got it — {profile['diet']}, avoiding {avoid}. "
-              "I'll filter every menu for you from now on."),
-    )
+
+    user_id = event["user"]
+    channel_id = event["channel"]
+    text = (event.get("text") or "").strip()
+    if not text:
+        return
+
+    if looks_like_profile(text):
+        ONBOARDING.discard(user_id)
+        client.chat_postMessage(channel=channel_id, text=save_profile(user_id, text))
+        return
+
+    if user_id in ONBOARDING:
+        if text.lower().strip(".!") in SKIP_WORDS:
+            ONBOARDING.discard(user_id)
+            client.chat_postMessage(
+                channel=channel_id,
+                text=save_profile(user_id, db.DEFAULT_DIET))
+        else:
+            client.chat_postMessage(
+                channel=channel_id,
+                text=("I didn't catch a diet in that. One line like "
+                      "`veg, no mushroom, 250` — or say `skip` and I'll assume "
+                      "you eat anything."),
+            )
+        return
+
+    # Set-up commands are channel-scoped, so in a DM they would silently
+    # configure the DM itself. Only questions belong here.
+    if text.lower().strip("?!. ") in ("help", "what can you do"):
+        client.chat_postMessage(channel=channel_id, text=HELP)
+        return
+    prompt = ADDRESS_PROMPT if text.lower().startswith("address") else text
+    ask_visibly(channel_id, prompt, servers=["food", "im", "dineout"])
 
 
 # ---------------------------------------------------------------------- main

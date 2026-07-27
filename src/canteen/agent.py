@@ -59,6 +59,7 @@ Rules you must not break:
   an allergy. If allergies come up, say what was filtered and add the caveat.
 - Money is in whole rupees. Never invent a price you did not read from a tool.
 - Be brief. One or two sentences. This is a chat channel, not a report.
+- Write for Slack. No markdown tables and no headings — they do not render.
 """
 
 AUTHORISED = (
