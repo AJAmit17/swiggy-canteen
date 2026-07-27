@@ -5,8 +5,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 
 DEFAULT_DIET = "nonveg"
+
+# sqlite3 connections cannot be used from a thread other than the one that
+# created them, and Slack Bolt runs every listener on a pool thread while
+# APScheduler runs jobs on its own. So connections are per-thread, not global.
+_local = threading.local()
 
 SCHEMA = """
 create table if not exists swiggy_token (
@@ -63,8 +69,18 @@ create table if not exists par_level (
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or os.environ.get("CANTEEN_DB", "canteen.db"))
+    """The connection for the calling thread, opened on first use.
+
+    Safe and cheap to call on every access — callers should not cache the
+    result across threads.
+    """
+    target = path or os.environ.get("CANTEEN_DB", "canteen.db")
+    if getattr(_local, "path", None) == target:
+        return _local.conn
+    conn = sqlite3.connect(target)
     conn.row_factory = sqlite3.Row
+    _local.conn = conn
+    _local.path = target
     return conn
 
 

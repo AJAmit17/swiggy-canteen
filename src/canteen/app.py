@@ -43,11 +43,20 @@ app = App(
     token_verification_enabled=os.environ.get("CANTEEN_VERIFY_SLACK", "1") == "1",
 )
 claude = anthropic.Anthropic()
-http = httpx.Client(timeout=30)
-conn = db.connect()
-db.init_schema(conn)
+http = httpx.Client(timeout=30)  # httpx.Client is thread-safe; sqlite3 is not
+db.init_schema(db.connect())
 
 CLIENT_ID = os.environ.get("SWIGGY_CLIENT_ID", "")
+
+
+def store():
+    """The DB handle for whichever thread is asking.
+
+    Bolt dispatches listeners on a pool and APScheduler uses its own thread, so
+    this must never be hoisted into a module-level variable.
+    """
+    return db.connect()
+
 
 # Per-channel scratch space for the agent's structured tool reports.
 PANTRY_DRAFT: dict[str, list[dict]] = {}
@@ -55,13 +64,34 @@ DINEOUT_DRAFT: dict[str, list[dict]] = {}
 
 
 def token() -> str:
-    return swiggy_auth.valid_token(conn, http, CLIENT_ID)
+    return swiggy_auth.valid_token(store(), http, CLIENT_ID)
+
+
+@app.error
+def handle_uncaught(error, body, logger):
+    """Without this, a failed listener is silent in Slack and only visible in
+    the server log — the user is left staring at a message that never updates."""
+    logger.exception("listener failed: %s", error)
+    channel_id = (body or {}).get("channel_id") or (
+        (body or {}).get("channel") or {}
+    ).get("id")
+    if not channel_id:
+        return
+    if isinstance(error, swiggy_auth.NotAuthenticated):
+        text = ("No Swiggy account is linked yet. An admin needs to run the login "
+                "flow — see the README.")
+    else:
+        text = f"That didn't work: `{error}`. Nothing was ordered."
+    try:
+        app.client.chat_postMessage(channel=channel_id, text=text)
+    except Exception:
+        logger.exception("could not report the error back to Slack")
 
 
 def _participants(user_ids: list[str]) -> list[Participant]:
     return [
         Participant(p["user_id"], p["diet"], p["blocklist"])
-        for p in db.get_profiles(conn, user_ids)
+        for p in db.get_profiles(store(), user_ids)
     ]
 
 
@@ -73,9 +103,9 @@ def _solve_for(channel_id: str, candidates: list[dict]) -> dict:
     result = solve(
         to_candidates(candidates),
         people,
-        db.get_policy(conn, channel_id),
-        db.restaurant_ratings(conn),
-        db.recent_orders(conn, channel_id, now - REPEAT_WINDOW_SECONDS),
+        db.get_policy(store(), channel_id),
+        db.restaurant_ratings(store()),
+        db.recent_orders(store(), channel_id, now - REPEAT_WINDOW_SECONDS),
         now,
     )
     if isinstance(result, Rejection):
@@ -93,7 +123,7 @@ def _solve_for(channel_id: str, candidates: list[dict]) -> dict:
 
 def _record_pantry_items(channel_id: str, items: list[dict]) -> dict:
     """The `record_pantry_items` local tool. Claude fetches, this diffs."""
-    needed = pantry.restock_diff(items, db.par_levels(conn), {})
+    needed = pantry.restock_diff(items, db.par_levels(store()), {})
     PANTRY_DRAFT[channel_id] = needed
     return {"ok": True, "restock_count": len(needed),
             "total": pantry.restock_total(needed)}
@@ -103,7 +133,7 @@ def _record_dineout_slots(channel_id: str, restaurants: list[dict],
                           party_size: int, preferred_hour: int) -> dict:
     """The `record_dineout_slots` local tool. Claude fetches, this ranks."""
     options = dineout.rank_slots(restaurants, party_size, preferred_hour,
-                                 db.restaurant_ratings(conn))
+                                 db.restaurant_ratings(store()))
     DINEOUT_DRAFT[channel_id] = options
     return {"ok": True, "options": options}
 
@@ -112,12 +142,12 @@ def local_ctx(channel_id: str) -> dict:
     """The local tools Claude may call, bound to this channel."""
     return {
         "solve_restaurant": lambda candidates: _solve_for(channel_id, candidates),
-        "get_policy": lambda: db.get_policy(conn, channel_id),
+        "get_policy": lambda: db.get_policy(store(), channel_id),
         "record_rating": lambda restaurant_id, score: (
-            db.record_rating(conn, "agent", restaurant_id, score) or "recorded"
+            db.record_rating(store(), "agent", restaurant_id, score) or "recorded"
         ),
         "log_spend": lambda user_id, order_id, amount: (
-            db.record_spend(conn, user_id, order_id, amount) or "recorded"
+            db.record_spend(store(), user_id, order_id, amount) or "recorded"
         ),
         "record_pantry_items": lambda items: _record_pantry_items(channel_id, items),
         "record_dineout_slots": lambda restaurants, party_size, preferred_hour: (
@@ -135,7 +165,7 @@ def ask(channel_id: str, prompt: str, servers: list[str],
 # ---------------------------------------------------------------- lunch flow
 
 def start_roll_call(channel_id: str) -> None:
-    office = db.get_office(conn, channel_id) or {}
+    office = db.get_office(store(), channel_id) or {}
     deadline = close_time(office.get("roll_call_time", DEFAULT_ROLL_CALL),
                           ROLL_CALL_WINDOW_MINUTES)
     posted = app.client.chat_postMessage(
@@ -149,7 +179,7 @@ def close_roll_call(channel_id: str) -> None:
     state = lunch.STORE.get(channel_id)
     if not state or not state.participants:
         return
-    office = db.get_office(conn, channel_id)
+    office = db.get_office(store(), channel_id)
     if not office:
         app.client.chat_postMessage(
             channel=channel_id,
@@ -294,11 +324,11 @@ def handle_place_order(ack, body, client):
         return
 
     lunch.mark_placed(state, "placed")
-    db.record_order(conn, channel_id, state.pick.candidate.id,
+    db.record_order(store(), channel_id, state.pick.candidate.id,
                     state.pick.candidate.name, state.pick.candidate.cuisines,
                     state.participants, lunch.cart_total(state), time.time())
     for user_id, item in state.cart.items():
-        db.record_spend(conn, user_id, state.order_id or "placed", item["price"])
+        db.record_spend(store(), user_id, state.order_id or "placed", item["price"])
 
     client.chat_update(channel=channel_id, ts=state.message_ts, text="Ordered",
                        blocks=blocks.tracking(state.pick.candidate.name, reply, "—"))
@@ -321,7 +351,7 @@ def _register_rating(score: int):
     @app.action(f"rate_{score}")
     def handler(ack, body, client, _score=score):
         ack()
-        db.record_rating(conn, body["user"]["id"], body["actions"][0]["value"], _score)
+        db.record_rating(store(), body["user"]["id"], body["actions"][0]["value"], _score)
         client.chat_postEphemeral(channel=body["channel"]["id"],
                                   user=body["user"]["id"],
                                   text="Noted — that shapes the next pick.")
@@ -335,8 +365,8 @@ for _n in range(1, 6):
 # -------------------------------------------------------------------- pantry
 
 def run_pantry_check(channel_id: str) -> None:
-    office = db.get_office(conn, channel_id)
-    par = db.par_levels(conn)
+    office = db.get_office(store(), channel_id)
+    par = db.par_levels(store())
     if not office or not par:
         return
     ask(
@@ -451,15 +481,15 @@ def handle_command(ack, body, client, respond):
     channel_id = body["channel_id"]
 
     if sub == "setup" and len(parts) >= 2:
-        db.upsert_office(conn, channel_id, parts[1],
+        db.upsert_office(store(), channel_id, parts[1],
                          parts[2] if len(parts) > 2 else DEFAULT_TZ,
                          parts[3] if len(parts) > 3 else DEFAULT_ROLL_CALL)
         respond("Office saved. Restart me to pick up the new roll-call schedule.")
     elif sub == "policy" and len(parts) >= 2:
-        db.upsert_policy(conn, channel_id, int(parts[1]), parts[2:])
+        db.upsert_policy(store(), channel_id, int(parts[1]), parts[2:])
         respond(f"Per-head cap ₹{parts[1]}. Allowlist: {parts[2:] or 'any vendor'}.")
     elif sub == "par" and len(parts) >= 4:
-        db.set_par_level(conn, parts[1], " ".join(parts[2:-1]), int(parts[-1]))
+        db.set_par_level(store(), parts[1], " ".join(parts[2:-1]), int(parts[-1]))
         respond("Par level saved.")
     elif sub == "now":
         start_roll_call(channel_id)
@@ -518,7 +548,7 @@ def handle_dm(body, client, logger):
     if event.get("channel_type") != "im" or event.get("bot_id"):
         return
     profile = parse_profile(event.get("text", ""))
-    db.upsert_profile(conn, event["user"], profile["diet"],
+    db.upsert_profile(store(), event["user"], profile["diet"],
                       profile["blocklist"], profile["budget"])
     avoid = ", ".join(profile["blocklist"]) or "nothing"
     client.chat_postMessage(
@@ -531,7 +561,7 @@ def handle_dm(body, client, logger):
 # ---------------------------------------------------------------------- main
 
 def _schedule(scheduler: BackgroundScheduler) -> int:
-    offices = conn.execute("select * from office").fetchall()
+    offices = store().execute("select * from office").fetchall()
     for office in offices:
         channel_id = office["channel_id"]
         tz = office["timezone"]
