@@ -8,8 +8,6 @@ features:
     always_online: true
   app_home:
     home_tab_enabled: false
-    # Without these two, the bot's DM is read-only and onboarding replies
-    # can never be sent.
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   slash_commands:

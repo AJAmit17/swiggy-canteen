@@ -1,26 +1,49 @@
-"""Claude via the Anthropic MCP connector.
+"""GPT via the OpenAI Responses API remote-MCP tool.
 
-Swiggy's tools are executed server-side by the Anthropic API — we declare the
-three MCP servers and Claude calls them directly. We never write an MCP client.
-Our own tools (solver, policy, ratings) are ordinary local tools we dispatch.
+Swiggy's tools are executed server-side by OpenAI — we declare the three MCP
+servers and the model calls them directly. We never write an MCP client.
+Our own tools (solver, policy, ratings) are ordinary function tools we dispatch.
 
-Payment gate: the three tools in SPEND_TOOLS move real money. Cart assembly
-runs without an explicit authorisation in the system prompt, and only the
-handlers behind a Slack button click pass `extra_system` authorising an order.
+Payment gate: the three tools in SPEND_TOOLS move real money. `allowed_tools`
+omits them entirely unless the caller passed the AUTHORISED preamble, which only
+handlers behind a Slack button click do. The gate is therefore enforced by the
+API's allowlist, not by asking the model nicely.
 """
 
 from __future__ import annotations
 
 import json
+import os
 
-MODEL = "claude-opus-5"
-MCP_BETA = "mcp-client-2025-11-20"
+# Override with CANTEEN_MODEL if your key has access to something newer.
+MODEL = os.environ.get("CANTEEN_MODEL", "gpt-5.5")
 MAX_TURNS = 12
 
 SERVERS = {
     "food": ("swiggy-food", "https://mcp.swiggy.com/food"),
     "im": ("swiggy-im", "https://mcp.swiggy.com/im"),
     "dineout": ("swiggy-dineout", "https://mcp.swiggy.com/dineout"),
+}
+
+# allowed_tools is an allowlist, so the full inventory has to be written down.
+# If Swiggy adds a tool it stays invisible until it is listed here.
+SERVER_TOOLS = {
+    "food": [
+        "search_restaurants", "get_restaurant_menu", "search_menu", "get_addresses",
+        "get_food_cart", "update_food_cart", "flush_food_cart", "fetch_food_coupons",
+        "apply_food_coupon", "place_food_order", "get_food_orders",
+        "get_food_order_details", "track_food_order", "report_error",
+    ],
+    "im": [
+        "search_products", "your_go_to_items", "get_addresses", "create_address",
+        "delete_address", "get_cart", "update_cart", "clear_cart", "checkout",
+        "get_orders", "get_order_details", "track_order", "report_error",
+    ],
+    "dineout": [
+        "search_restaurants_dineout", "get_restaurant_details", "get_saved_locations",
+        "get_available_slots", "create_cart", "book_table", "get_booking_status",
+        "report_error",
+    ],
 }
 
 SPEND_TOOLS = {"place_food_order", "checkout", "book_table"}
@@ -44,13 +67,14 @@ AUTHORISED = (
 
 LOCAL_TOOLS = [
     {
+        "type": "function",
         "name": "solve_restaurant",
         "description": (
             "Pick the restaurant for a group order. Given the candidate restaurants "
             "you fetched from Swiggy, returns the choice, a runner-up, and the reason. "
             "This is the only acceptable way to choose a restaurant for a group."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "candidates": {
@@ -67,16 +91,18 @@ LOCAL_TOOLS = [
         },
     },
     {
+        "type": "function",
         "name": "get_policy",
         "description": (
             "The current channel's spending policy: per-head cap and vendor allowlist."
         ),
-        "input_schema": {"type": "object", "properties": {}},
+        "parameters": {"type": "object", "properties": {}},
     },
     {
+        "type": "function",
         "name": "record_rating",
         "description": "Store a 1-5 rating of a restaurant so future picks improve.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "restaurant_id": {"type": "string"},
@@ -86,9 +112,10 @@ LOCAL_TOOLS = [
         },
     },
     {
+        "type": "function",
         "name": "log_spend",
         "description": "Record what one person's share of an order cost, in whole rupees.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "user_id": {"type": "string"},
@@ -99,12 +126,13 @@ LOCAL_TOOLS = [
         },
     },
     {
+        "type": "function",
         "name": "record_pantry_items",
         "description": (
             "Report the Instamart go-to items you fetched, so the par-level diff can "
             "run. Pass every item with its product_id, name and unit price in rupees."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "items": {
@@ -124,13 +152,14 @@ LOCAL_TOOLS = [
         },
     },
     {
+        "type": "function",
         "name": "record_dineout_slots",
         "description": (
             "Report the dineout restaurants and their available slots you fetched, so "
             "the ranking can run. Each restaurant needs id, name, rating and a slots "
             "array of {slot_id, hour, time, capacity, is_free}."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "restaurants": {"type": "array", "items": {"type": "object"}},
@@ -143,21 +172,26 @@ LOCAL_TOOLS = [
 ]
 
 
-def mcp_servers(token: str, names: list[str]) -> list[dict]:
+def mcp_tools(token: str, names: list[str], allow_spend: bool = False) -> list[dict]:
+    """One Responses-API `mcp` tool per Swiggy server.
+
+    OpenAI does not store the token, so it is resupplied on every request.
+    """
     out = []
     for n in names:
-        server_name, url = SERVERS[n]  # KeyError on a typo, deliberately
+        label, url = SERVERS[n]  # KeyError on a typo, deliberately
+        allowed = [
+            t for t in SERVER_TOOLS[n] if allow_spend or t not in SPEND_TOOLS
+        ]
         out.append({
-            "type": "url",
-            "name": server_name,
-            "url": url,
-            "authorization_token": token,
+            "type": "mcp",
+            "server_label": label,
+            "server_url": url,
+            "authorization": token,
+            "require_approval": "never",  # the human gate is the Slack button
+            "allowed_tools": allowed,
         })
     return out
-
-
-def toolsets(names: list[str]) -> list[dict]:
-    return [{"type": "mcp_toolset", "mcp_server_name": SERVERS[n][0]} for n in names]
 
 
 def dispatch_local(name: str, args: dict, ctx: dict) -> str:
@@ -175,43 +209,43 @@ def dispatch_local(name: str, args: dict, ctx: dict) -> str:
 
 def run(client, prompt: str, token: str, servers: list[str], ctx: dict,
         extra_system: str | None = None) -> str:
-    """Drive the agent loop until the model stops calling tools.
+    """Drive the agent loop until the model stops calling our function tools.
 
-    MCP tool calls execute inside the Anthropic API, so the only tool_use blocks
-    that reach this loop are our local ones.
+    MCP tool calls execute inside the OpenAI API, so the only calls that reach
+    this loop are the local ones. Spending tools are only even visible to the
+    model when the caller supplied the AUTHORISED preamble.
     """
-    system = SYSTEM if not extra_system else SYSTEM + "\n" + extra_system
-    messages: list[dict] = [{"role": "user", "content": prompt}]
+    instructions = SYSTEM if not extra_system else SYSTEM + "\n" + extra_system
+    tools = [
+        *mcp_tools(token, servers, allow_spend=extra_system == AUTHORISED),
+        *LOCAL_TOOLS,
+    ]
+    conversation: list = [{"role": "user", "content": prompt}]
 
     for _ in range(MAX_TURNS):
-        response = client.beta.messages.create(
+        response = client.responses.create(
             model=MODEL,
-            max_tokens=8000,
-            betas=[MCP_BETA],
-            system=system,
-            mcp_servers=mcp_servers(token, servers),
-            tools=[*toolsets(servers), *LOCAL_TOOLS],
-            messages=messages,
+            instructions=instructions,
+            tools=tools,
+            input=conversation,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        conversation = conversation + list(response.output)
 
-        if response.stop_reason == "pause_turn":
-            continue  # server-side tool loop hit its cap; resend to resume
+        calls = [item for item in response.output if item.type == "function_call"]
+        if not calls:
+            return (response.output_text or "").strip()
 
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-        if not tool_uses:
-            return "".join(b.text for b in response.content if b.type == "text").strip()
-
-        messages.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": b.id,
-                    "content": dispatch_local(b.name, b.input, ctx),
-                }
-                for b in tool_uses
-            ],
-        })
+        for call in calls:
+            try:
+                args = json.loads(call.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                output = f"Error: arguments were not valid JSON ({exc})."
+            else:
+                output = dispatch_local(call.name, args, ctx)
+            conversation.append({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output,
+            })
 
     return "I got stuck working on that — try again or narrow the request."

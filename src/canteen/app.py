@@ -15,10 +15,10 @@ import logging
 import os
 import time
 
-import anthropic
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
+from openai import OpenAI
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -42,7 +42,7 @@ app = App(
     token=os.environ["SLACK_BOT_TOKEN"],
     token_verification_enabled=os.environ.get("CANTEEN_VERIFY_SLACK", "1") == "1",
 )
-claude = anthropic.Anthropic()
+gpt = OpenAI()
 http = httpx.Client(timeout=30)  # httpx.Client is thread-safe; sqlite3 is not
 db.init_schema(db.connect())
 
@@ -158,7 +158,7 @@ def local_ctx(channel_id: str) -> dict:
 
 def ask(channel_id: str, prompt: str, servers: list[str],
         extra_system: str | None = None) -> str:
-    return agent.run(claude, prompt=prompt, token=token(), servers=servers,
+    return agent.run(gpt, prompt=prompt, token=token(), servers=servers,
                      ctx=local_ctx(channel_id), extra_system=extra_system)
 
 

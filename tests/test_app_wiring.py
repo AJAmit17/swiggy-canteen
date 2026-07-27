@@ -10,7 +10,7 @@ import threading
 
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test")
-os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test")
+os.environ.setdefault("OPENAI_API_KEY", "sk-openai-test")
 os.environ.setdefault("CANTEEN_VERIFY_SLACK", "0")
 os.environ.setdefault(
     "CANTEEN_DB", os.path.join(tempfile.mkdtemp(), "wiring.db")
