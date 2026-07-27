@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -15,6 +16,12 @@ def test_every_server_is_declared_as_one_mcp_tool_with_the_token():
     assert all(t["type"] == "mcp_server" for t in tools)
     # Swiggy authenticates via the header Google forwards to the MCP endpoint.
     assert all(t["headers"] == {"Authorization": "Bearer tok-abc"} for t in tools)
+
+
+def test_server_names_are_lowercase_snake_case():
+    """Gemini 400s on anything else, and the SDK's own model does not catch it."""
+    for tool in agent.mcp_tools("tok", list(agent.SERVERS)):
+        assert re.fullmatch(r"[a-z][a-z0-9_]*", tool["name"]), tool["name"]
 
 
 def test_unknown_server_name_is_rejected_loudly():

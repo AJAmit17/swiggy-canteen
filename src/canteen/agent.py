@@ -19,10 +19,11 @@ import os
 MODEL = os.environ.get("CANTEEN_MODEL", "gemini-3.6-flash")
 MAX_TURNS = 12
 
+# Gemini rejects an MCP server name that is not lowercase snake_case.
 SERVERS = {
-    "food": ("swiggy-food", "https://mcp.swiggy.com/food"),
-    "im": ("swiggy-im", "https://mcp.swiggy.com/im"),
-    "dineout": ("swiggy-dineout", "https://mcp.swiggy.com/dineout"),
+    "food": ("swiggy_food", "https://mcp.swiggy.com/food"),
+    "im": ("swiggy_im", "https://mcp.swiggy.com/im"),
+    "dineout": ("swiggy_dineout", "https://mcp.swiggy.com/dineout"),
 }
 
 # allowed_tools is an allowlist, so the full inventory has to be written down.
