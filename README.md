@@ -38,7 +38,7 @@ On allergens: Swiggy menu data has no allergen field. Filtering runs on the
 structured veg/egg/jain tags and each person's own blocked keywords, and the bot
 says exactly that rather than claiming anything is safe.
 
-There is no MCP client here. OpenAI's Responses API hosted `mcp` tool talks to
+There is no MCP client here. Gemini's Interactions API `mcp_server` tool talks to
 `mcp.swiggy.com` server-side; we pass the host account's OAuth token and the model
 calls all 35 Swiggy tools directly.
 
@@ -95,7 +95,7 @@ usual per-meal budget. Diet is `veg`, `jain`, `egg`, or `nonveg`.
 | File | Responsibility |
 |---|---|
 | `brain.py` | The solver — diet, budget, repeat fatigue, taste memory. Pure |
-| `agent.py` | GPT over the Responses API MCP tool; local tool dispatch |
+| `agent.py` | Gemini over the Interactions API MCP tool; local tool dispatch |
 | `swiggy_auth.py` | OAuth 2.1 PKCE, dynamic client registration, auto-refresh |
 | `db.py` | SQLite — profiles, policy, history, ratings, par levels |
 | `lunch.py` | Group-lunch state machine |

@@ -1,6 +1,6 @@
-"""GPT via the OpenAI Responses API remote-MCP tool.
+"""Gemini via the Interactions API remote-MCP tool.
 
-Swiggy's tools are executed server-side by OpenAI — we declare the three MCP
+Swiggy's tools are executed server-side by Google — we declare the three MCP
 servers and the model calls them directly. We never write an MCP client.
 Our own tools (solver, policy, ratings) are ordinary function tools we dispatch.
 
@@ -16,7 +16,7 @@ import json
 import os
 
 # Override with CANTEEN_MODEL if your key has access to something newer.
-MODEL = os.environ.get("CANTEEN_MODEL", "gpt-5.5")
+MODEL = os.environ.get("CANTEEN_MODEL", "gemini-3.6-flash")
 MAX_TURNS = 12
 
 SERVERS = {
@@ -173,9 +173,10 @@ LOCAL_TOOLS = [
 
 
 def mcp_tools(token: str, names: list[str], allow_spend: bool = False) -> list[dict]:
-    """One Responses-API `mcp` tool per Swiggy server.
+    """One Interactions-API `mcp_server` tool per Swiggy server.
 
-    OpenAI does not store the token, so it is resupplied on every request.
+    The Swiggy OAuth token rides in the Authorization header Google sends to the
+    MCP endpoint. Google does not store it, so it is resupplied every request.
     """
     out = []
     for n in names:
@@ -184,12 +185,11 @@ def mcp_tools(token: str, names: list[str], allow_spend: bool = False) -> list[d
             t for t in SERVER_TOOLS[n] if allow_spend or t not in SPEND_TOOLS
         ]
         out.append({
-            "type": "mcp",
-            "server_label": label,
-            "server_url": url,
-            "authorization": token,
-            "require_approval": "never",  # the human gate is the Slack button
-            "allowed_tools": allowed,
+            "type": "mcp_server",
+            "name": label,
+            "url": url,
+            "headers": {"Authorization": f"Bearer {token}"},
+            "allowed_tools": [{"mode": "auto", "tools": allowed}],
         })
     return out
 
@@ -211,41 +211,44 @@ def run(client, prompt: str, token: str, servers: list[str], ctx: dict,
         extra_system: str | None = None) -> str:
     """Drive the agent loop until the model stops calling our function tools.
 
-    MCP tool calls execute inside the OpenAI API, so the only calls that reach
+    MCP tool calls execute inside the Gemini API, so the only calls that reach
     this loop are the local ones. Spending tools are only even visible to the
     model when the caller supplied the AUTHORISED preamble.
+
+    Each turn sends only the new function results and links back with
+    `previous_interaction_id`; Google keeps the transcript. Tools and the system
+    instruction are interaction-scoped, so they are resent every turn.
     """
-    instructions = SYSTEM if not extra_system else SYSTEM + "\n" + extra_system
-    tools = [
-        *mcp_tools(token, servers, allow_spend=extra_system == AUTHORISED),
-        *LOCAL_TOOLS,
-    ]
-    conversation: list = [{"role": "user", "content": prompt}]
+    settings = {
+        "model": MODEL,
+        "system_instruction": SYSTEM if not extra_system else SYSTEM + "\n" + extra_system,
+        "tools": [
+            *mcp_tools(token, servers, allow_spend=extra_system == AUTHORISED),
+            *LOCAL_TOOLS,
+        ],
+    }
+    payload: str | list = prompt
+    previous_id: str | None = None
 
     for _ in range(MAX_TURNS):
-        response = client.responses.create(
-            model=MODEL,
-            instructions=instructions,
-            tools=tools,
-            input=conversation,
+        interaction = client.interactions.create(
+            input=payload, previous_interaction_id=previous_id, **settings
         )
-        conversation = conversation + list(response.output)
+        previous_id = interaction.id
 
-        calls = [item for item in response.output if item.type == "function_call"]
+        calls = [s for s in (interaction.steps or []) if s.type == "function_call"]
         if not calls:
-            return (response.output_text or "").strip()
+            return (interaction.output_text or "").strip()
 
-        for call in calls:
-            try:
-                args = json.loads(call.arguments or "{}")
-            except json.JSONDecodeError as exc:
-                output = f"Error: arguments were not valid JSON ({exc})."
-            else:
-                output = dispatch_local(call.name, args, ctx)
-            conversation.append({
-                "type": "function_call_output",
-                "call_id": call.call_id,
-                "output": output,
-            })
+        payload = [
+            {
+                "type": "function_result",
+                "call_id": call.id,
+                "name": call.name,
+                # arguments arrives already decoded, unlike the other providers
+                "result": dispatch_local(call.name, call.arguments or {}, ctx),
+            }
+            for call in calls
+        ]
 
     return "I got stuck working on that — try again or narrow the request."
