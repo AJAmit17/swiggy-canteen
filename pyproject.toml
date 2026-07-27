@@ -1,0 +1,32 @@
+[project]
+name = "canteen"
+version = "0.1.0"
+description = "Slack bot for team food ordering, pantry restocking and table booking via Swiggy MCP"
+readme = "README.md"
+authors = [
+    { name = "Amit Acharya", email = "amit@lyzr.ai" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.120.0",
+    "apscheduler>=3.11.3",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+    "slack-bolt>=1.30.0",
+]
+
+[project.scripts]
+canteen = "canteen.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["uv_build>=0.11.23,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
