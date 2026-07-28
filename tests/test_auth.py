@@ -70,6 +70,14 @@ def test_parse_callback_tolerates_surrounding_chat_text():
     assert got == {"code": "abc", "state": "st"}
 
 
+def test_parse_callback_survives_slacks_ampersand_escaping():
+    """Slack rewrites & to &amp; in message text. Unhandled, parse_qs names the
+    second parameter 'amp;state' and every paste fails the state check."""
+    got = auth.parse_callback(
+        "<http://localhost:8765/callback?code=abc&amp;state=st-1>")
+    assert got == {"code": "abc", "state": "st-1"}
+
+
 def test_parse_callback_surfaces_an_oauth_error():
     got = auth.parse_callback(
         "http://localhost:8765/callback?error=access_denied&state=st")

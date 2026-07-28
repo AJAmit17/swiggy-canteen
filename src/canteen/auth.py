@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import re
 import secrets
 import urllib.parse
@@ -69,8 +70,11 @@ def parse_callback(text: str) -> dict:
 
     People paste with a sentence wrapped around it, and Slack wraps bare URLs
     in angle brackets, so this scans rather than parses the whole message.
+
+    Slack also escapes & as &amp; in message text. Unescaped, parse_qs reads the
+    second parameter as "amp;state" and the state check compares against None.
     """
-    match = _CALLBACK.search(text or "")
+    match = _CALLBACK.search(html.unescape(text or ""))
     if not match:
         return {}
     params = urllib.parse.parse_qs(match.group(1))

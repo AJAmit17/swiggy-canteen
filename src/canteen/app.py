@@ -179,7 +179,12 @@ def handle_dm(body, client):
         try:
             auth.complete_link(db(), http, user_id, text, time.time())
         except auth.LinkFailed as exc:
-            client.chat_postMessage(channel=channel_id, text=f":warning: {exc}")
+            # The pending record is consumed either way, so hand them a fresh
+            # link rather than leaving them with a dead end.
+            client.chat_postMessage(
+                channel=channel_id, text=f":warning: {exc} Here's a fresh link.",
+                blocks=blocks.connect_prompt(
+                    auth.begin_link(db(), user_id, time.time())))
             return
         client.chat_postMessage(
             channel=channel_id,
