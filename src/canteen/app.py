@@ -92,8 +92,12 @@ def local_ctx(user_id: str, channel_id: str) -> dict:
 # ------------------------------------------------------------ model access
 
 def converse(channel_id: str, user_id: str, prompt: str, servers: list[str],
-             extra_system: str | None = None) -> str:
-    """One turn of conversation, continuing whatever came before in this channel."""
+             extra_system: str | None = None, allow_spend: bool = False) -> str:
+    """One turn of conversation, continuing whatever came before in this channel.
+
+    allow_spend is what actually unlocks the money tools, and only a button
+    handler passes it.
+    """
     instruction = extra_system or agent.system_for(
         store.get_preference(db(), user_id))
     reply, interaction_id = agent.run(
@@ -103,6 +107,7 @@ def converse(channel_id: str, user_id: str, prompt: str, servers: list[str],
         servers=servers,
         ctx=local_ctx(user_id, channel_id),
         extra_system=instruction,
+        allow_spend=allow_spend,
         previous_id=store.get_interaction(db(), channel_id),
     )
     if interaction_id:
@@ -235,6 +240,7 @@ def handle_confirm_purchase(ack, body, client):
             servers=servers,
             extra_system=agent.system_for(store.get_preference(db(), user_id))
             + "\n" + agent.AUTHORISED,
+            allow_spend=True,
         )
     except Exception as exc:
         log.exception("order failed")
@@ -277,6 +283,7 @@ def handle_confirm_booking(ack, body, client):
             servers=["dineout"],
             extra_system=agent.system_for(store.get_preference(db(), user_id))
             + "\n" + agent.AUTHORISED,
+            allow_spend=True,
         )
     except Exception as exc:
         log.exception("booking failed")
