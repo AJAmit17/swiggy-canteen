@@ -1,122 +1,91 @@
-# Swiggy Canteen
+# Swiggy for Slack
 
-A Slack bot that runs a team's food ordering, pantry restocking, and table
-booking through the [Swiggy MCP servers](https://mcp.swiggy.com/builders/docs/start/).
+Order food, order groceries, and book tables from Slack — by talking, through the
+[Swiggy MCP servers](https://mcp.swiggy.com/builders/docs/start/).
 
-The Swiggy app already serves one person well. It has no group surface, no memory
-of who on a team eats what, and no policy layer. That gap is what this fills.
+Everyone uses their own Swiggy account. There are no commands to learn.
 
 ## What it does
 
-**Group lunch.** At 11:30 the bot posts one message in `#lunch`. People tap in.
-At 12:00 it closes, then solves: which single restaurant can feed everyone given
-their diets, the per-head cap, and what the team already ate this fortnight. It
-posts the pick with a one-line reason, opens a five-minute veto window, sends each
-person a menu filtered to what they can eat, assembles the cart, applies the best
-coupon, and — after somebody clicks **Place order** — tracks the delivery. Every
-stage edits the same message.
+**DM the bot** to use your own Swiggy account:
 
-**Pantry.** A weekly job reads Instamart's `your_go_to_items`, diffs it against
-your par levels, and posts a restock list to approve.
+> order me a masala dosa from somewhere south indian
+> what did I order last week?
+> we're out of milk and coffee — get some
+> book a table for four on Saturday at 8
 
-**Tables.** Ask for a table and it fans out across restaurants and slots, ranks the
-three best, and books the one you click.
+**Mention it in a channel** for group things:
+
+> @Swiggy lunch — group food order on your account
+> @Swiggy book a table for 8 at 8pm
+> @Swiggy restock the pantry
 
 ## Design
 
-Two rules the code enforces rather than merely intends:
+**Money needs a human.** `place_food_order`, `checkout` and `book_table` are only
+reachable from a handler behind a button click — the API is never even told those
+tools exist until then. Everything else assembles a cart and stops.
 
-**The model handles language; Python handles decisions.** The model parses requests
-and writes the copy. It never decides whether a diet is satisfied, whether an order
-is under budget, or when to spend money. That is `brain.py` — pure, tested Python.
+**We hold almost no state.** Swiggy owns the cart and the orders, Gemini owns the
+conversation transcript. What's left on disk is a token per person, a preference
+line, one interaction id per channel, and any group flow currently running.
 
-**Money needs a human.** `place_food_order`, `checkout`, and `book_table` are only
-ever called from a handler behind a button click. The scheduled and conversational
-paths assemble carts and stop.
+**No MCP client here.** Gemini's Interactions API `mcp_server` tool talks to
+`mcp.swiggy.com` server-side; we pass each person's OAuth token and the model
+calls the Swiggy tools directly.
 
-On allergens: Swiggy menu data has no allergen field. Filtering runs on the
-structured veg/egg/jain tags and each person's own blocked keywords, and the bot
-says exactly that rather than claiming anything is safe.
-
-There is no MCP client here. Gemini's Interactions API `mcp_server` tool talks to
-`mcp.swiggy.com` server-side; we pass the host account's OAuth token and the model
-calls all 35 Swiggy tools directly.
+On allergens: Swiggy menu data has no allergen field. The bot says what it
+filtered on and that it cannot verify ingredients, rather than claiming anything
+is safe.
 
 ## Setup
 
-```bash
-uv sync
-cp .env.example .env      # fill in the tokens
-```
+1. Create the Slack app from `slack-app-manifest.yaml`, install it, and copy the
+   bot token (`xoxb-`) and an app-level token with `connections:write` (`xapp-`).
+2. Get a Gemini API key at <https://aistudio.google.com/apikey>.
+3. Copy `.env.example` to `.env` and fill in the three values.
+4. `uv sync && uv run canteen`
 
-**Slack app** — create one at [api.slack.com/apps](https://api.slack.com/apps):
+## Connecting Swiggy
 
-- Enable **Socket Mode** (no public URL or ngrok needed)
-- Bot scopes: `chat:write`, `commands`, `app_mentions:read`, `im:history`, `im:write`
-- Event subscriptions: `app_mention`, `message.im`
-- Slash command: `/canteen`
-- Install to the workspace — `SLACK_BOT_TOKEN` is the `xoxb-` token,
-  `SLACK_APP_TOKEN` the `xapp-` one
+Each person connects their own account, once. DM the bot and it walks you
+through it:
 
-**Link the Swiggy host account** (once, from a terminal with a browser):
+1. Click the sign-in link it sends you.
+2. Sign in to Swiggy.
+3. Your browser lands on a page that **fails to load**. That is expected —
+   nothing is listening on that address.
+4. Copy that page's URL from the address bar and paste it back into the DM.
 
-```bash
-uv run python -c "from canteen import db, swiggy_auth; c = db.connect(); db.init_schema(c); print('SWIGGY_CLIENT_ID=' + swiggy_auth.login(c))"
-```
-
-This does dynamic client registration, opens the consent page, and captures the
-callback on `http://localhost:8765/callback`. Put the printed client id in `.env`.
-
-## Run
-
-```bash
-uv run canteen
-uv run pytest          # 101 tests, no network
-```
-
-Then in Slack:
-
-```
-/canteen setup <swiggy_address_id> Asia/Kolkata 11:30   # link this channel to an office
-/canteen policy 250 <restaurant_id> ...                 # per-head cap + vendor allowlist
-/canteen par <product_id> Milk 1L 6                     # pantry target quantity
-/canteen me                                             # set your diet via DM
-/canteen now                                            # open a roll call immediately
-/canteen addresses                                      # list the account's Swiggy addresses
-```
-
-`/canteen addresses` is the easiest way to find the address id for `setup`.
-
-Onboarding is one line in a DM: `veg, no mushroom, 250` — diet, things to avoid,
-usual per-meal budget. Diet is `veg`, `jain`, `egg`, or `nonveg`.
+Your token is stored against your Slack user id. Carts, orders and addresses are
+yours alone. Say `reset` in the DM to start a fresh conversation.
 
 ## Layout
 
 | File | Responsibility |
 |---|---|
-| `brain.py` | The solver — diet, budget, repeat fatigue, taste memory. Pure |
-| `agent.py` | Gemini over the Interactions API MCP tool; local tool dispatch |
-| `swiggy_auth.py` | OAuth 2.1 PKCE, dynamic client registration, auto-refresh |
-| `db.py` | SQLite — profiles, policy, history, ratings, par levels |
-| `lunch.py` | Group-lunch state machine |
+| `store.py` | SQLite — tokens, preferences, interaction ids, group flows |
+| `auth.py` | Per-user OAuth 2.1 + PKCE, the paste flow, auto-refresh |
+| `agent.py` | Gemini over the Interactions API MCP tool; money guards |
 | `blocks.py` | Slack Block Kit builders. Pure |
-| `parsing.py` | Agent JSON → solver types; profile text parsing. Pure |
-| `pantry.py` / `dineout.py` | Par-level diff; slot ranking. Pure |
-| `app.py` | Bolt handlers, scheduler, and the bridge between the above |
+| `slackfmt.py` | Markdown → Slack mrkdwn. Pure |
+| `app.py` | Bolt app: DM assistant, spend handlers, error reporting |
+| `group.py` | The three channel flows: group food, table booking, pantry |
 
-Every module except `app.py` is pure or I/O-isolated, which is why the test suite
-needs no network and no Slack workspace.
+`uv run pytest` — 94 tests, no network and no Slack workspace needed.
 
 ## Known limits
 
-- **One Swiggy account pays.** Per-person shares are tracked locally as a
-  chargeback aid, not an audit trail — they can drift from the actual Swiggy bill.
-- **One restaurant per group order.** That is Swiggy's cart constraint, not ours.
-  When a team splits on cuisine the bot picks one and says so.
-- **An in-flight lunch is in memory.** A restart loses it; nothing already paid for
-  lives there.
-- **Order failures are never blind-retried.** On a failure the bot polls recent
-  orders to check whether it actually landed, then tells you. Double-ordering is
-  the worst thing this system could do.
+- **The host pays for a group order.** It goes on the Swiggy account of whoever
+  started the flow, and only they can click Place order.
+- **One restaurant per food cart.** Swiggy's constraint, not ours — switching
+  restaurants empties the cart, and the bot asks first.
+- **Food orders are COD-only and capped at ₹1000; Instamart needs ₹99 minimum.**
+  Both are checked before a confirm button is ever shown.
+- **A pending confirmation is in memory.** A restart drops it, deliberately —
+  nobody should be able to confirm an hour-old cart that has changed underneath.
+- **Order failures are never blind-retried.** On a failure the bot reads back
+  recent orders and reports what it finds. Double-ordering is the worst thing
+  this system could do.
 
 Design notes: `docs/superpowers/specs/` · implementation plan: `docs/superpowers/plans/`

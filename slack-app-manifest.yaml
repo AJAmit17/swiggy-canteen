@@ -1,25 +1,21 @@
 display_information:
-  name: Canteen
-  description: Orders team lunch, restocks the pantry, and books tables via Swiggy.
+  name: Swiggy
+  description: Order food and groceries, and book tables, from Slack.
   background_color: "#fc8019"
 features:
   bot_user:
-    display_name: Canteen
+    display_name: Swiggy
     always_online: true
   app_home:
     home_tab_enabled: false
+    # Without these two the bot's DM is read-only, and the DM is the whole
+    # personal assistant.
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
-  slash_commands:
-    - command: /canteen
-      description: Set up the office, policy, your diet, or start a lunch order
-      usage_hint: "now | me | setup <address_id> | policy <cap> | addresses"
-      should_escape: false
 oauth_config:
   scopes:
     bot:
       - chat:write
-      - commands
       - app_mentions:read
       - im:history
       - im:write
