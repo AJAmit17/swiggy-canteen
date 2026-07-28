@@ -1,138 +1,122 @@
-"""Slack Block Kit builders. Pure — every function returns a list of dicts."""
+"""Block Kit builders. Pure — no Slack client, no database, no model."""
 
 from __future__ import annotations
 
-from canteen.brain import ALLERGEN_CAVEAT, Dish, Pick
-
-SLACK_MAX_OPTIONS = 100
+import json
 
 
 def _section(text: str) -> dict:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
 
 
-def _context(text: str) -> dict:
-    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
-
-
-def _button(text: str, action_id: str, value: str = "x", style: str | None = None) -> dict:
-    b = {
+def _button(text: str, action_id: str, value: str = "1",
+            style: str | None = None) -> dict:
+    element = {
         "type": "button",
         "text": {"type": "plain_text", "text": text},
         "action_id": action_id,
         "value": value,
     }
     if style:
-        b["style"] = style
-    return b
+        element["style"] = style
+    return element
 
 
-def roll_call(deadline: str) -> list[dict]:
+def _actions(*elements: dict) -> dict:
+    return {"type": "actions", "elements": list(elements)}
+
+
+def connect_prompt(url: str) -> list:
     return [
-        _section(f"*Lunch?* Tap in by *{deadline}* and I'll sort the rest."),
-        {"type": "actions", "elements": [_button("I'm in", "join_lunch", style="primary")]},
-        _context("No tap, no lunch. You can still join before the order goes in."),
+        _section(
+            "*Connect your Swiggy account*\nOrders, carts and addresses stay "
+            "yours — I never see anyone else's."
+        ),
+        _section(
+            f"1. <{url}|Sign in to Swiggy>\n"
+            "2. Afterwards your browser lands on a page that *won't load* — "
+            "that is expected.\n"
+            "3. Copy that page's address from the URL bar and paste it here."
+        ),
     ]
 
 
-def pick_message(pick: Pick, participants: list[str], seconds_left: int) -> list[dict]:
-    who = " ".join(f"<@{u}>" for u in participants)
-    bs = [
-        _section(f"Ordering from {pick.reason}"),
-        _context(f"{len(participants)} in: {who}"),
-    ]
-    if pick.runner_up and seconds_left > 0:
-        bs.append({
-            "type": "actions",
-            "elements": [
-                _button(f"Switch to {pick.runner_up.name}", "veto_pick", pick.runner_up.id)
-            ],
-        })
-        bs.append(_context(f"Switching closes in {max(seconds_left // 60, 1)} min."))
-    return bs
-
-
-def dish_picker(dishes: list[Dish]) -> list[dict]:
-    if not dishes:
-        return [
-            _section("Nothing on this menu matches what you eat, so I've left you out."),
-            _context(ALLERGEN_CAVEAT),
-        ]
-    options = [
-        {
-            "text": {"type": "plain_text", "text": f"{d.name} — ₹{d.price}"[:75]},
-            "value": f"{d.name}|{d.price}"[:150],
-        }
-        for d in dishes[:SLACK_MAX_OPTIONS]
-    ]
+def confirm_purchase(service: str, total: int, summary: str) -> list:
+    label = "Place order" if service == "food" else "Check out"
     return [
-        _section("Pick your dish. This list is already filtered to what you eat."),
-        {
-            "type": "actions",
-            "elements": [{
-                "type": "static_select",
-                "action_id": "choose_dish",
-                "placeholder": {"type": "plain_text", "text": "Choose a dish"},
-                "options": options,
-            }],
-        },
-        _context(ALLERGEN_CAVEAT),
+        _section(f"{summary}\n*Total ₹{total}* · cash on delivery (COD)"),
+        _actions(
+            _button(f"{label} · ₹{total}", "confirm_purchase", service, "primary"),
+            _button("Cancel", "cancel_purchase", service),
+        ),
     ]
 
 
-def confirm(restaurant_name: str, lines: list[str], total: int) -> list[dict]:
+def confirm_booking(proposal: dict) -> list:
     return [
-        _section(f"*{restaurant_name}* — cart ready\n" + "\n".join(lines)),
-        _section(f"*Total: ₹{total}*"),
-        {"type": "actions", "elements": [
-            _button("Place order", "place_order", style="primary"),
-            _button("Cancel", "cancel_lunch", style="danger"),
-        ]},
+        _section(
+            f"*{proposal['restaurant_name']}*\n"
+            f"{proposal['date']} at {proposal['time']} · "
+            f"{proposal['guest_count']} people"
+        ),
+        _actions(
+            _button("Book it", "confirm_booking", "1", "primary"),
+            _button("Cancel", "cancel_purchase", "dineout"),
+        ),
     ]
 
 
-def tracking(restaurant_name: str, status: str, eta: str) -> list[dict]:
+def group_food(host_user_id: str, restaurant_name: str | None, lines: list[str],
+               total: int, joined: list[str]) -> list:
+    who = ", ".join(f"<@{u}>" for u in joined) or "nobody yet"
+    header = (f"*Group lunch* — on <@{host_user_id}>'s Swiggy account\n"
+              f"In: {who}")
+    payload = [_section(header)]
+
+    if not restaurant_name:
+        payload.append(_section(
+            f"<@{host_user_id}>, tell me in this thread where we're ordering from."))
+        payload.append(_actions(
+            _button("Join", "join_group", "1"),
+            _button("Cancel", "cancel_group", "1"),
+        ))
+        return payload
+
+    body = "\n".join(lines) if lines else "_Cart is empty._"
+    payload.append(_section(f"*{restaurant_name}*\n{body}\n\n*Total ₹{total}*"))
+    payload.append(_actions(
+        _button("Add my dish", "add_my_dish", "1"),
+        _button(f"Place order · ₹{total}", "place_group_order", "1", "primary"),
+        _button("Cancel", "cancel_group", "1"),
+    ))
+    return payload
+
+
+def pantry_list(items: list[dict], total: int) -> list:
+    lines = "\n".join(
+        f"• {i['name']} ×{i['quantity']} — ₹{i['price']}" for i in items
+    ) or "_Nothing suggested._"
     return [
-        _section(f"*{restaurant_name}* — {status}"),
-        _context(f"ETA {eta}"),
+        _section(f"*Pantry restock*\n{lines}\n\n*Total ₹{total}* · cash on delivery"),
+        _actions(
+            _button(f"Order · ₹{total}", "confirm_purchase", "instamart", "primary"),
+            _button("Cancel", "cancel_purchase", "instamart"),
+        ),
     ]
 
 
-def rate_prompt(restaurant_id: str, restaurant_name: str) -> list[dict]:
-    return [
-        _section(f"How was *{restaurant_name}*?"),
-        {"type": "actions", "elements": [
-            _button("★" * n, f"rate_{n}", restaurant_id) for n in range(1, 6)
-        ]},
-    ]
-
-
-def pantry_approval(items: list[dict], total: int) -> list[dict]:
-    lines = "\n".join(f"• {i['name']} ×{i['qty']} — ₹{i['price']}" for i in items)
-    return [
-        _section(f"*Pantry restock* — {len(items)} items\n{lines}"),
-        _section(f"*Total: ₹{total}*"),
-        {"type": "actions", "elements": [
-            _button("Approve", "approve_pantry", style="primary"),
-            _button("Skip this week", "skip_pantry"),
-        ]},
-    ]
-
-
-def dineout_options(options: list[dict]) -> list[dict]:
-    bs = [_section("*Table options*")]
-    for o in options:
-        bs.append({
+def table_options(options: list[dict]) -> list:
+    """One button per slot. The whole proposal rides in the button value so the
+    click handler needs no lookup — Slack caps that value at 2000 characters."""
+    payload = [_section("*Tables I can book*")]
+    for option in options:
+        value = json.dumps(option, separators=(",", ":"))[:2000]
+        payload.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{o['restaurant_name']}* — {o['time']}"},
-            "accessory": _button("Book", "book_slot",
-                                 f"{o['restaurant_id']}|{o['slot_id']}"),
+            "text": {"type": "mrkdwn",
+                     "text": (f"*{option['restaurant_name']}* · "
+                              f"{option['date']} at {option['time']} · "
+                              f"{option['guest_count']} people")},
         })
-    return bs
-
-
-def rejection(reason: str) -> list[dict]:
-    return [
-        _section(f"No lunch order today. {reason}"),
-        _context("Raise the per-head cap or split into two orders and I'll try again."),
-    ]
+        payload.append(_actions(_button("Pick this", "pick_slot", value)))
+    return payload
