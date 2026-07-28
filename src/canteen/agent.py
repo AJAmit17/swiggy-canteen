@@ -2,7 +2,8 @@
 
 Swiggy's tools are executed server-side by Google — we declare the three MCP
 servers and the model calls them directly. We never write an MCP client.
-Our own tools (solver, policy, ratings) are ordinary function tools we dispatch.
+Our own three tools — the two that ask a human to approve spending, and the one
+that remembers a preference — are ordinary function tools we dispatch.
 
 Payment gate: the three tools in SPEND_TOOLS move real money. `allowed_tools`
 omits them entirely unless the caller passed the AUTHORISED preamble, which only
@@ -49,126 +50,123 @@ SERVER_TOOLS = {
 
 SPEND_TOOLS = {"place_food_order", "checkout", "book_table"}
 
-SYSTEM = """You are the office canteen assistant, working inside Slack.
+# Swiggy v1 limits, enforced here rather than left to the model.
+FOOD_CAP_RUPEES = 1000
+INSTAMART_MIN_RUPEES = 99
 
-Rules you must not break:
-- You never decide who can eat what. Call `solve_restaurant` and use its answer.
-- You never place an order, check out, or book a table on your own initiative.
-  A human clicks a button for that. Assemble the cart and stop.
-- Swiggy menu data has no allergen field. Never tell anyone a dish is safe for
-  an allergy. If allergies come up, say what was filtered and add the caveat.
-- Money is in whole rupees. Never invent a price you did not read from a tool.
-- Be brief. One or two sentences. This is a chat channel, not a report.
-- Write for Slack. No markdown tables and no headings — they do not render.
+
+def blocked_reason(service: str, total: int) -> str | None:
+    """Why this cart may not be ordered yet, or None if it may."""
+    if service == "food" and total > FOOD_CAP_RUPEES:
+        return (f"That cart is ₹{total}, over Swiggy's ₹{FOOD_CAP_RUPEES} limit "
+                "for this kind of order. Drop an item or two.")
+    if service == "instamart" and total < INSTAMART_MIN_RUPEES:
+        return (f"Instamart needs at least ₹{INSTAMART_MIN_RUPEES} and this cart "
+                f"is ₹{total}. Add something else.")
+    return None
+
+
+SYSTEM = """You are a Swiggy assistant living in Slack. You order food, order
+groceries from Instamart, and book restaurant tables — by talking, not by
+making people learn commands.
+
+How to work:
+- The cart lives on Swiggy's servers, not in this conversation. Before you talk
+  about a cart or change it, call get_food_cart or get_cart and use what comes
+  back. Never quote a total you did not just read from a tool.
+- Only suggest restaurants whose availabilityStatus is OPEN, and dineout
+  restaurants whose availability is AVAILABLE.
+- The food cart holds one restaurant at a time. Changing restaurant empties it —
+  say so and get a yes before you do it.
+- Payment is cash on delivery only, so ignore coupons that need online payment.
+
+How orders actually happen:
+- You never place an order, check out, or book a table yourself. When everything
+  is ready, call propose_purchase or propose_booking. A human then clicks a
+  button, and only then are you asked to complete it.
+- Confirm the date, party size and time out loud before proposing a booking.
+
+Being honest:
+- Swiggy's menu data has no allergen information. Never say a dish is safe for
+  an allergy. Say what you filtered on and that you cannot verify ingredients.
+- Money is in whole rupees.
+- If someone tells you a lasting preference — diet, a dislike, a usual budget —
+  call remember_preference so you do not ask again.
+
+How to write:
+- Slack, not email. Two or three sentences. No tables, no headings.
 """
 
 AUTHORISED = (
     "The user has explicitly authorised this transaction by clicking a button. "
-    "You may complete it now."
+    "Re-read the cart first. If the total differs materially from what they "
+    "approved, stop and say so instead of ordering. Otherwise complete it now "
+    "and report the id."
 )
+
+
+def system_for(preference: str | None) -> str:
+    """The system instruction, with this person's standing preferences."""
+    if not preference:
+        return SYSTEM
+    return f"{SYSTEM}\nWhat this person has told you before: {preference}"
+
 
 LOCAL_TOOLS = [
     {
         "type": "function",
-        "name": "solve_restaurant",
+        "name": "propose_purchase",
         "description": (
-            "Pick the restaurant for a group order. Given the candidate restaurants "
-            "you fetched from Swiggy, returns the choice, a runner-up, and the reason. "
-            "This is the only acceptable way to choose a restaurant for a group."
+            "Call when a Swiggy cart is ready to be paid for. Shows the human a "
+            "confirm button. This is the only way an order can happen — you "
+            "cannot place it yourself. Read the total from get_food_cart or "
+            "get_cart immediately before calling this."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "candidates": {
-                    "type": "array",
-                    "description": (
-                        "Restaurants from search_restaurants, each with id, name, "
-                        "cuisines, eta_minutes, is_open, deliverable, and a dishes "
-                        "array of {name, price, veg, contains_egg, jain}."
-                    ),
-                    "items": {"type": "object"},
-                }
+                "service": {"type": "string", "enum": ["food", "instamart"]},
+                "total": {"type": "integer",
+                          "description": "Cart total in whole rupees, from the cart tool."},
+                "summary": {"type": "string",
+                            "description": "One line: what is in the cart and from where."},
             },
-            "required": ["candidates"],
+            "required": ["service", "total", "summary"],
         },
     },
     {
         "type": "function",
-        "name": "get_policy",
+        "name": "propose_booking",
         "description": (
-            "The current channel's spending policy: per-head cap and vendor allowlist."
+            "Call when a specific dineout slot is ready to be booked. Shows the "
+            "human a confirm button. You cannot book a table yourself."
         ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "type": "function",
-        "name": "record_rating",
-        "description": "Store a 1-5 rating of a restaurant so future picks improve.",
         "parameters": {
             "type": "object",
             "properties": {
                 "restaurant_id": {"type": "string"},
-                "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                "restaurant_name": {"type": "string"},
+                "slot_id": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "time": {"type": "string", "description": "As shown to the user, IST"},
+                "guest_count": {"type": "integer"},
             },
-            "required": ["restaurant_id", "score"],
+            "required": ["restaurant_id", "restaurant_name", "slot_id", "date",
+                         "time", "guest_count"],
         },
     },
     {
         "type": "function",
-        "name": "log_spend",
-        "description": "Record what one person's share of an order cost, in whole rupees.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string"},
-                "order_id": {"type": "string"},
-                "amount": {"type": "integer"},
-            },
-            "required": ["user_id", "order_id", "amount"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "record_pantry_items",
+        "name": "remember_preference",
         "description": (
-            "Report the Instamart go-to items you fetched, so the par-level diff can "
-            "run. Pass every item with its product_id, name and unit price in rupees."
+            "Store a lasting fact about this person — diet, dislikes, usual "
+            "budget — so it is not asked again. Pass the whole preference line, "
+            "not just the new part."
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string"},
-                            "name": {"type": "string"},
-                            "price": {"type": "integer"},
-                        },
-                        "required": ["product_id", "name", "price"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "record_dineout_slots",
-        "description": (
-            "Report the dineout restaurants and their available slots you fetched, so "
-            "the ranking can run. Each restaurant needs id, name, rating and a slots "
-            "array of {slot_id, hour, time, capacity, is_free}."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "restaurants": {"type": "array", "items": {"type": "object"}},
-                "party_size": {"type": "integer"},
-                "preferred_hour": {"type": "integer"},
-            },
-            "required": ["restaurants", "party_size", "preferred_hour"],
+            "properties": {"note": {"type": "string"}},
+            "required": ["note"],
         },
     },
 ]
@@ -210,37 +208,38 @@ def dispatch_local(name: str, args: dict, ctx: dict) -> str:
 
 
 def run(client, prompt: str, token: str, servers: list[str], ctx: dict,
-        extra_system: str | None = None) -> str:
+        extra_system: str | None = None,
+        previous_id: str | None = None) -> tuple[str, str]:
     """Drive the agent loop until the model stops calling our function tools.
 
-    MCP tool calls execute inside the Gemini API, so the only calls that reach
-    this loop are the local ones. Spending tools are only even visible to the
-    model when the caller supplied the AUTHORISED preamble.
+    Returns (reply_text, interaction_id). The caller stores the id and passes it
+    back as previous_id next turn — that is the entire multi-turn state model,
+    because Google keeps the transcript and Swiggy keeps the cart.
 
-    Each turn sends only the new function results and links back with
-    `previous_interaction_id`; Google keeps the transcript. Tools and the system
-    instruction are interaction-scoped, so they are resent every turn.
+    MCP tool calls execute inside the Gemini API, so the only calls reaching
+    this loop are local ones. Spending tools are visible to the model only when
+    the caller supplied the AUTHORISED preamble.
     """
     settings = {
         "model": MODEL,
-        "system_instruction": SYSTEM if not extra_system else SYSTEM + "\n" + extra_system,
+        "system_instruction": extra_system or SYSTEM,
         "tools": [
-            *mcp_tools(token, servers, allow_spend=extra_system == AUTHORISED),
+            *mcp_tools(token, servers, allow_spend=AUTHORISED in (extra_system or "")),
             *LOCAL_TOOLS,
         ],
     }
     payload: str | list = prompt
-    previous_id: str | None = None
+    interaction_id = previous_id
 
     for _ in range(MAX_TURNS):
         interaction = client.interactions.create(
-            input=payload, previous_interaction_id=previous_id, **settings
+            input=payload, previous_interaction_id=interaction_id, **settings
         )
-        previous_id = interaction.id
+        interaction_id = interaction.id
 
         calls = [s for s in (interaction.steps or []) if s.type == "function_call"]
         if not calls:
-            return (interaction.output_text or "").strip()
+            return (interaction.output_text or "").strip(), interaction_id
 
         payload = [
             {
@@ -253,4 +252,5 @@ def run(client, prompt: str, token: str, servers: list[str], ctx: dict,
             for call in calls
         ]
 
-    return "I got stuck working on that — try again or narrow the request."
+    return ("I got stuck working on that — try again or narrow the request.",
+            interaction_id)

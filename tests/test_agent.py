@@ -86,6 +86,86 @@ def test_every_listed_server_tool_belongs_to_exactly_one_server():
     assert {k: len(v) for k, v in agent.SERVER_TOOLS.items()} == counts
 
 
+def test_local_tools_are_exactly_the_three_the_bot_acts_on():
+    assert {t["name"] for t in agent.LOCAL_TOOLS} == {
+        "propose_purchase", "propose_booking", "remember_preference"}
+
+
+def test_money_guard_blocks_a_food_cart_over_the_cap():
+    assert agent.blocked_reason("food", 1001) is not None
+    assert "1000" in agent.blocked_reason("food", 1001)
+    assert agent.blocked_reason("food", 1000) is None
+
+
+def test_money_guard_blocks_an_instamart_cart_under_the_minimum():
+    assert "99" in agent.blocked_reason("instamart", 98)
+    assert agent.blocked_reason("instamart", 99) is None
+
+
+def test_money_guard_ignores_services_without_a_cart():
+    assert agent.blocked_reason("dineout", 0) is None
+
+
+def test_the_preference_line_reaches_the_system_instruction():
+    assert "no mushroom" in agent.system_for("vegetarian, no mushroom")
+    assert agent.system_for(None) == agent.SYSTEM
+
+
+def test_run_returns_the_interaction_id_so_the_next_turn_can_continue():
+    class FakeClient:
+        class interactions:
+            @staticmethod
+            def create(**kw):
+                return type("I", (), {"id": "i_7", "steps": [],
+                                      "output_text": "done"})()
+
+    text, interaction_id = agent.run(FakeClient(), prompt="hi", token="t",
+                                     servers=["food"], ctx={})
+    assert text == "done"
+    assert interaction_id == "i_7"
+
+
+def test_run_passes_the_previous_interaction_id_on_the_first_call():
+    """Continuity is the whole multi-turn state model — Google holds the
+    transcript and we hold one id."""
+    seen = []
+
+    class FakeClient:
+        class interactions:
+            @staticmethod
+            def create(**kw):
+                seen.append(kw)
+                return type("I", (), {"id": "i_2", "steps": [],
+                                      "output_text": "ok"})()
+
+    agent.run(FakeClient(), prompt="and then?", token="t", servers=["food"],
+              ctx={}, previous_id="i_1")
+    assert seen[0]["previous_interaction_id"] == "i_1"
+
+
+def test_spend_tools_appear_only_when_the_instruction_carries_the_authorisation():
+    """The gate now reads a substring, because extra_system carries the whole
+    instruction including preferences."""
+    seen = []
+
+    class FakeClient:
+        class interactions:
+            @staticmethod
+            def create(**kw):
+                seen.append(kw)
+                return type("I", (), {"id": "i", "steps": [],
+                                      "output_text": "x"})()
+
+    agent.run(FakeClient(), prompt="p", token="t", servers=["food"], ctx={},
+              extra_system=agent.system_for("vegetarian"))
+    agent.run(FakeClient(), prompt="p", token="t", servers=["food"], ctx={},
+              extra_system=agent.system_for("vegetarian") + "\n" + agent.AUTHORISED)
+
+    plain, authorised = (kw["tools"][0]["allowed_tools"][0]["tools"] for kw in seen)
+    assert "place_food_order" not in plain
+    assert "place_food_order" in authorised
+
+
 def test_local_tool_schemas_are_well_formed():
     for tool in agent.LOCAL_TOOLS:
         assert tool["type"] == "function"
@@ -114,8 +194,8 @@ def test_run_feeds_local_tool_results_back_as_function_results():
                 return type("I", (), {"id": "i_2", "steps": [],
                                       "output_text": "cap is 250"})()
 
-    out = agent.run(FakeClient(), prompt="what is the cap?", token="t",
-                    servers=["food"], ctx={"get_policy": lambda: {"cap": 250}})
+    out, _ = agent.run(FakeClient(), prompt="what is the cap?", token="t",
+                       servers=["food"], ctx={"get_policy": lambda: {"cap": 250}})
 
     assert out == "cap is 250"
     result = turns[1]["input"][0]
@@ -143,8 +223,8 @@ def test_run_gives_up_rather_than_looping_forever():
                 return type("I", (), {"id": "i_1", "steps": [Call()],
                                       "output_text": ""})()
 
-    out = agent.run(FakeClient(), prompt="p", token="t", servers=["food"],
-                    ctx={"get_policy": lambda: "x"})
+    out, _ = agent.run(FakeClient(), prompt="p", token="t", servers=["food"],
+                       ctx={"get_policy": lambda: "x"})
     assert len(calls) == agent.MAX_TURNS
     assert "stuck" in out
 
