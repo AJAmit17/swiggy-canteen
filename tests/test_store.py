@@ -59,13 +59,15 @@ def test_preferences_round_trip(tmp_path):
     assert store.get_preference(conn, "U1") == "vegetarian, no mushroom, ~300"
 
 
-def test_interaction_id_round_trips_and_clears(tmp_path):
+def test_history_round_trips_and_clears(tmp_path):
     conn = fresh(tmp_path)
-    assert store.get_interaction(conn, "D1") is None
-    store.set_interaction(conn, "D1", "i_1", 1000.0)
-    assert store.get_interaction(conn, "D1") == "i_1"
-    store.clear_interaction(conn, "D1")
-    assert store.get_interaction(conn, "D1") is None
+    assert store.get_history(conn, "D1") is None
+    messages = [{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}]
+    store.set_history(conn, "D1", messages, 1000.0)
+    assert store.get_history(conn, "D1") == messages
+    store.clear_history(conn, "D1")
+    assert store.get_history(conn, "D1") is None
 
 
 def test_group_context_survives_as_a_dict(tmp_path):

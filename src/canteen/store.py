@@ -1,8 +1,10 @@
 """SQLite persistence. Every read and write to disk goes through this module.
 
-We deliberately hold almost nothing: Swiggy owns the cart and the orders,
-Gemini owns the conversation transcript. What is left is a token per person, a
-preference line, an interaction id, and any group flow currently running.
+We deliberately hold almost nothing: Swiggy owns the cart and the orders. The
+Messages API is stateless, so unlike a server-side-transcript provider, we are
+the ones holding the conversation history per channel. What is left is a token
+per person, a preference line, that history, and any group flow currently
+running.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ create table if not exists preference (
 );
 create table if not exists conversation (
     key text primary key,
-    interaction_id text not null,
+    messages text not null,
     updated_at real not null
 );
 create table if not exists group_order (
@@ -133,25 +135,28 @@ def get_preference(conn, user_id: str) -> str | None:
     return row["note"] if row else None
 
 
-# --- Gemini conversation continuity ---
+# --- conversation continuity ---
+#
+# The Messages API is stateless, so we hold the transcript ourselves, keyed by
+# a channel/DM id, and hand the whole thing back on the next turn.
 
-def set_interaction(conn, key: str, interaction_id: str, updated_at: float) -> None:
+def set_history(conn, key: str, messages: list[dict], updated_at: float) -> None:
     conn.execute(
-        "insert into conversation (key, interaction_id, updated_at) values (?, ?, ?) "
-        "on conflict(key) do update set interaction_id=excluded.interaction_id, "
+        "insert into conversation (key, messages, updated_at) values (?, ?, ?) "
+        "on conflict(key) do update set messages=excluded.messages, "
         "updated_at=excluded.updated_at",
-        (key, interaction_id, updated_at),
+        (key, json.dumps(messages), updated_at),
     )
     conn.commit()
 
 
-def get_interaction(conn, key: str) -> str | None:
-    row = conn.execute("select interaction_id from conversation where key = ?",
+def get_history(conn, key: str) -> list[dict] | None:
+    row = conn.execute("select messages from conversation where key = ?",
                        (key,)).fetchone()
-    return row["interaction_id"] if row else None
+    return json.loads(row["messages"]) if row else None
 
 
-def clear_interaction(conn, key: str) -> None:
+def clear_history(conn, key: str) -> None:
     conn.execute("delete from conversation where key = ?", (key,))
     conn.commit()
 

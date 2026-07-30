@@ -60,7 +60,7 @@ def test_fenced_code_blocks_are_never_rewritten():
     assert to_mrkdwn(src) == src
 
 
-def test_a_real_gemini_reply_converts_cleanly():
+def test_a_real_model_reply_converts_cleanly():
     raw = (
         "Here are your saved addresses:\n\n"
         "1. **HOSTEL** (ID: `clgo9g9g0aucvgf77msg`) – Bhoganhalli\n"

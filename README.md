@@ -26,11 +26,13 @@ Everyone uses their own Swiggy account. There are no commands to learn.
 reachable from a handler behind a button click — the API is never even told those
 tools exist until then. Everything else assembles a cart and stops.
 
-**We hold almost no state.** Swiggy owns the cart and the orders, Gemini owns the
-conversation transcript. What's left on disk is a token per person, a preference
-line, one interaction id per channel, and any group flow currently running.
+**We hold almost no state.** Swiggy owns the cart and the orders. Claude's
+Messages API is stateless, so we hold the conversation transcript ourselves —
+that's the only reason it's on disk at all. What's left is a token per person, a
+preference line, that transcript per channel, and any group flow currently
+running.
 
-**No MCP client here.** Gemini's Interactions API `mcp_server` tool talks to
+**No MCP client here.** Claude's Messages API MCP connector talks to
 `mcp.swiggy.com` server-side; we pass each person's OAuth token and the model
 calls the Swiggy tools directly.
 
@@ -42,7 +44,7 @@ is safe.
 
 1. Create the Slack app from `slack-app-manifest.yaml`, install it, and copy the
    bot token (`xoxb-`) and an app-level token with `connections:write` (`xapp-`).
-2. Get a Gemini API key at <https://aistudio.google.com/apikey>.
+2. Get an Anthropic API key at <https://console.anthropic.com>.
 3. Copy `.env.example` to `.env` and fill in the three values.
 4. `uv sync && uv run canteen`
 
@@ -64,9 +66,9 @@ yours alone. Say `reset` in the DM to start a fresh conversation.
 
 | File | Responsibility |
 |---|---|
-| `store.py` | SQLite — tokens, preferences, interaction ids, group flows |
+| `store.py` | SQLite — tokens, preferences, conversation history, group flows |
 | `auth.py` | Per-user OAuth 2.1 + PKCE, the paste flow, auto-refresh |
-| `agent.py` | Gemini over the Interactions API MCP tool; money guards |
+| `agent.py` | Claude over the Messages API MCP connector; money guards |
 | `blocks.py` | Slack Block Kit builders. Pure |
 | `slackfmt.py` | Markdown → Slack mrkdwn. Pure |
 | `app.py` | Bolt app: DM assistant, spend handlers, error reporting |

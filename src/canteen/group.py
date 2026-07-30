@@ -138,7 +138,7 @@ def register(app, converse, progress, db, token_for) -> None:
         channel_id = body["channel"]["id"]
         row = store.get_group(db(), channel_id)
         store.delete_group(db(), channel_id)
-        store.clear_interaction(db(), channel_id)
+        store.clear_history(db(), channel_id)
         client.chat_update(channel=channel_id,
                            ts=(row or {}).get("message_ts") or body["message"]["ts"],
                            text="Group order cancelled.", blocks=[])

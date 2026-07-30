@@ -5,7 +5,7 @@ import tempfile
 
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test")
-os.environ.setdefault("GEMINI_API_KEY", "gemini-test")
+os.environ.setdefault("ANTHROPIC_API_KEY", "anthropic-test")
 os.environ.setdefault("CANTEEN_VERIFY_SLACK", "0")
 os.environ.setdefault("CANTEEN_DB", os.path.join(tempfile.mkdtemp(), "app.db"))
 
@@ -67,31 +67,33 @@ def test_proposing_a_booking_stores_the_whole_proposal():
     assert app.PROPOSALS[CHANNEL]["service"] == "dineout"
 
 
-def test_converse_stores_the_interaction_id_for_the_next_turn(monkeypatch):
-    monkeypatch.setattr(agent, "run",
-                        lambda *a, **k: ("**hi**", "i_42"))
+def test_converse_stores_the_full_message_history_for_the_next_turn(monkeypatch):
+    history = [{"role": "user", "content": "hello"},
+               {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]
+    monkeypatch.setattr(agent, "run", lambda *a, **k: ("**hi**", history))
     store.save_token(app.db(), USER, "acc", "ref", 9e9)
 
     reply = app.converse(CHANNEL, USER, "hello", servers=["food"])
 
     assert reply == "*hi*"  # mrkdwn conversion happened on the way out
-    assert store.get_interaction(app.db(), CHANNEL) == "i_42"
+    assert store.get_history(app.db(), CHANNEL) == history
 
 
-def test_converse_passes_the_stored_interaction_id_back(monkeypatch):
+def test_converse_passes_the_stored_history_back(monkeypatch):
     seen = {}
 
     def fake_run(client, **kw):
         seen.update(kw)
-        return "ok", "i_2"
+        return "ok", []
 
     monkeypatch.setattr(agent, "run", fake_run)
     store.save_token(app.db(), USER, "acc", "ref", 9e9)
-    store.set_interaction(app.db(), CHANNEL, "i_1", 0.0)
+    prior = [{"role": "user", "content": "hi"}]
+    store.set_history(app.db(), CHANNEL, prior, 0.0)
 
     app.converse(CHANNEL, USER, "and then?", servers=["food"])
 
-    assert seen["previous_id"] == "i_1"
+    assert seen["history"] == prior
 
 
 def test_converse_injects_the_persons_preference(monkeypatch):
@@ -99,7 +101,7 @@ def test_converse_injects_the_persons_preference(monkeypatch):
 
     def fake_run(client, **kw):
         seen.update(kw)
-        return "ok", "i_1"
+        return "ok", []
 
     monkeypatch.setattr(agent, "run", fake_run)
     store.save_token(app.db(), USER, "acc", "ref", 9e9)

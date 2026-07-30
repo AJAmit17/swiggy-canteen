@@ -12,9 +12,9 @@ import logging
 import os
 import time
 
+import anthropic
 import httpx
 from dotenv import load_dotenv
-from google import genai
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -34,7 +34,7 @@ app = App(
     token=os.environ["SLACK_BOT_TOKEN"],
     token_verification_enabled=os.environ.get("CANTEEN_VERIFY_SLACK", "1") == "1",
 )
-gemini = genai.Client()
+claude = anthropic.Anthropic()
 http = httpx.Client(timeout=30)  # httpx.Client is thread-safe; sqlite3 is not
 store.init_schema(store.connect())
 
@@ -100,18 +100,17 @@ def converse(channel_id: str, user_id: str, prompt: str, servers: list[str],
     """
     instruction = extra_system or agent.system_for(
         store.get_preference(db(), user_id))
-    reply, interaction_id = agent.run(
-        gemini,
+    reply, messages = agent.run(
+        claude,
         prompt=prompt,
         token=token_for(user_id),
         servers=servers,
         ctx=local_ctx(user_id, channel_id),
         extra_system=instruction,
         allow_spend=allow_spend,
-        previous_id=store.get_interaction(db(), channel_id),
+        history=store.get_history(db(), channel_id),
     )
-    if interaction_id:
-        store.set_interaction(db(), channel_id, interaction_id, time.time())
+    store.set_history(db(), channel_id, messages, time.time())
     return to_mrkdwn(reply)
 
 
@@ -199,7 +198,7 @@ def handle_dm(body, client):
         return
 
     if text.lower().strip("!.?") in ("reset", "start over", "forget it"):
-        store.clear_interaction(db(), channel_id)
+        store.clear_history(db(), channel_id)
         PROPOSALS.pop(channel_id, None)
         client.chat_postMessage(channel=channel_id, text="Fresh start. Go ahead.")
         return
