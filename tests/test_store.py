@@ -44,6 +44,15 @@ def test_pending_auth_can_only_be_taken_once(tmp_path):
     assert store.take_pending(conn, "U1") is None
 
 
+def test_pending_can_be_taken_by_state_instead_of_user_id(tmp_path):
+    """The real HTTP callback only has state, never the Slack user_id."""
+    conn = fresh(tmp_path)
+    store.save_pending(conn, "U1", "verifier", "state-abc", 1000.0)
+    got = store.take_pending_by_state(conn, "state-abc")
+    assert got["user_id"] == "U1"
+    assert store.take_pending_by_state(conn, "state-abc") is None
+
+
 def test_starting_a_second_link_replaces_the_first(tmp_path):
     conn = fresh(tmp_path)
     store.save_pending(conn, "U1", "v1", "s1", 1000.0)

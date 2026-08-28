@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: swiggy-canteen
+    runtime: python
+    plan: free
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run canteen
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CANTEEN_REDIRECT_URI
+        sync: false
+      - key: CANTEEN_DB
+        value: canteen.db
+    # ponytail: free plan has no persistent disk, so canteen.db resets on every
+    # deploy/restart (tokens, history, group state — all of it). Fine to get a
+    # real redirect_uri live; add a paid instance + disk before real usage.

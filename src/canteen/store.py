@@ -124,6 +124,18 @@ def take_pending(conn, user_id: str) -> dict | None:
     return dict(row)
 
 
+def take_pending_by_state(conn, state: str) -> dict | None:
+    """Same as take_pending, but for the real HTTP callback: it only ever
+    gets `state` back from Swiggy, never the Slack user_id."""
+    row = conn.execute("select * from pending_auth where state = ?",
+                       (state,)).fetchone()
+    if not row:
+        return None
+    conn.execute("delete from pending_auth where state = ?", (state,))
+    conn.commit()
+    return dict(row)
+
+
 # --- preferences ---
 
 def set_preference(conn, user_id: str, note: str) -> None:

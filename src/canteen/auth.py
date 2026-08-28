@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import os
 import re
 import secrets
 import urllib.parse
@@ -26,7 +27,10 @@ AUTH_BASE = "https://mcp.swiggy.com"
 # Registration always returns this same id regardless of what we send, so there
 # is nothing gained by calling POST /auth/register at runtime.
 CLIENT_ID = "swiggy-mcp"
-REDIRECT_URI = "http://localhost:8765/callback"
+# In production this is the deployed domain's real /callback (see callback.py);
+# swiggy.com won't accept a redirect_uri unless it's registered as this exact
+# value, so it must match whatever's actually deployed.
+REDIRECT_URI = os.environ.get("CANTEEN_REDIRECT_URI", "http://localhost:8765/callback")
 
 PENDING_TTL_SECONDS = 600        # how long a person has to finish signing in
 REFRESH_MARGIN_SECONDS = 300     # refresh this long before actual expiry
@@ -90,6 +94,21 @@ def begin_link(conn, user_id: str, now: float) -> str:
     return authorize_url(challenge, state)
 
 
+def _redeem_code(http, code: str, verifier: str) -> dict:
+    response = http.post(
+        AUTH_BASE + "/auth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": CLIENT_ID,
+            "code_verifier": verifier,
+        },
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def complete_link(conn, http, user_id: str, pasted: str, now: float) -> None:
     """Turn a pasted redirect URL into a stored token for this person."""
     got = parse_callback(pasted)
@@ -106,24 +125,34 @@ def complete_link(conn, http, user_id: str, pasted: str, now: float) -> None:
     if "error" in got:
         raise LinkFailed(f"Swiggy refused the sign-in: {got['error']}.")
 
-    response = http.post(
-        AUTH_BASE + "/auth/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": got["code"],
-            "redirect_uri": REDIRECT_URI,
-            "client_id": CLIENT_ID,
-            "code_verifier": pending["verifier"],
-        },
-    )
-    response.raise_for_status()
-    payload = response.json()
+    payload = _redeem_code(http, got["code"], pending["verifier"])
     store.save_token(
         conn, user_id,
         payload["access_token"],
         payload.get("refresh_token"),
         now + payload.get("expires_in", DEFAULT_TOKEN_LIFETIME),
     )
+
+
+def complete_link_by_state(conn, http, state: str, code: str, now: float) -> str:
+    """Same job as complete_link, for the real HTTP /callback: Swiggy hits it
+    directly with code/state in the query string, no Slack user_id in sight —
+    the state token is the only thing tying it back to whoever started this.
+    Returns the user_id so the caller can tell them they're connected."""
+    pending = store.take_pending_by_state(conn, state)
+    if not pending:
+        raise LinkFailed("No sign-in waiting for that state — it may have expired.")
+    if now - pending["created_at"] > PENDING_TTL_SECONDS:
+        raise LinkFailed("That sign-in expired. Start again.")
+
+    payload = _redeem_code(http, code, pending["verifier"])
+    store.save_token(
+        conn, pending["user_id"],
+        payload["access_token"],
+        payload.get("refresh_token"),
+        now + payload.get("expires_in", DEFAULT_TOKEN_LIFETIME),
+    )
+    return pending["user_id"]
 
 
 def valid_token(conn, http, user_id: str, now: float) -> str:

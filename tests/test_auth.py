@@ -159,6 +159,36 @@ def test_complete_link_reports_a_denied_authorisation(tmp_path):
             now=1000.0)
 
 
+def test_complete_link_by_state_finds_the_user_from_state_alone(tmp_path):
+    """The real HTTP callback only ever has code/state from Swiggy — no Slack
+    user_id — so state is the only thread back to who started this."""
+    conn = fresh(tmp_path)
+    auth.begin_link(conn, "U1", now=1000.0)
+    state = pending_state(conn)
+    http = FakeHTTP({"access_token": "acc", "refresh_token": "ref",
+                     "expires_in": 100})
+
+    user_id = auth.complete_link_by_state(conn, http, state, "xyz", now=1000.0)
+
+    assert user_id == "U1"
+    assert store.get_token(conn, "U1")["access_token"] == "acc"
+
+
+def test_complete_link_by_state_refuses_an_unknown_state(tmp_path):
+    conn = fresh(tmp_path)
+    with pytest.raises(auth.LinkFailed, match="No sign-in waiting"):
+        auth.complete_link_by_state(conn, FakeHTTP(), "no-such-state", "xyz", now=1000.0)
+
+
+def test_complete_link_by_state_refuses_an_expired_pending_record(tmp_path):
+    conn = fresh(tmp_path)
+    auth.begin_link(conn, "U1", now=1000.0)
+    state = pending_state(conn)
+    later = 1000.0 + auth.PENDING_TTL_SECONDS + 1
+    with pytest.raises(auth.LinkFailed, match="expired"):
+        auth.complete_link_by_state(conn, FakeHTTP(), state, "xyz", now=later)
+
+
 def test_valid_token_returns_a_live_token_without_calling_out(tmp_path):
     conn = fresh(tmp_path)
     store.save_token(conn, "U1", "acc", "ref", 9999.0)

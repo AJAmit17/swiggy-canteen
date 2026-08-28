@@ -380,8 +380,11 @@ def handle_uncaught(error, body, logger):
 
 
 def main() -> None:
-    from canteen import group
+    from canteen import callback, group
     group.register(app, converse, progress, db, token_for)
+    callback.start(
+        int(os.environ.get("PORT", 8765)), db, http,
+        notify=lambda user_id, text: app.client.chat_postMessage(channel=user_id, text=text))
     log.info("Swiggy assistant up. Connecting to Slack…")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
 
