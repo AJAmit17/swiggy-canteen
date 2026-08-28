@@ -71,7 +71,7 @@ def register(app, converse, progress, db, token_for) -> None:
             return
 
         if kind == TABLE:
-            finish = progress(channel_id)
+            finish, _ = progress(channel_id)
             reply = converse(
                 channel_id, user_id,
                 f"A group wants a table. Request: {text!r}. Use "
@@ -83,7 +83,7 @@ def register(app, converse, progress, db, token_for) -> None:
             finish(reply)
             return
 
-        finish = progress(channel_id)
+        finish, _ = progress(channel_id)
         reply = converse(
             channel_id, user_id,
             "Restock the office pantry. Call get_addresses, then "
@@ -116,6 +116,33 @@ def register(app, converse, progress, db, token_for) -> None:
                       f"started by <@{existing['host_user_id']}>. Cancel it first."))
             return
         start(channel_id, user_id, text, kind)
+
+    @app.event("message")
+    def handle_thread_reply(body, client):
+        """A reply, with no @mention, inside a thread the assistant already
+        started. Slack only ever tells us about a plain mention via
+        app_mention — everything else here is a generic message event, so
+        this is the only way to keep a conversation going without making
+        someone re-mention the bot every single turn.
+        """
+        event = body["event"]
+        if event.get("channel_type") == "im" or event.get("bot_id") or event.get("subtype"):
+            return  # DMs are app.py's job; ignore edits/deletes/bot echoes
+
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return  # a fresh top-level message, not a reply
+
+        from canteen.app import bot_user_id, respond
+        text = (event.get("text") or "").strip()
+        if not text or f"<@{bot_user_id(client)}>" in text:
+            return  # a real mention here already fired app_mention above
+
+        channel_id = event["channel"]
+        if not store.is_bot_thread(db(), channel_id, thread_ts):
+            return  # a thread we're not part of — not ours to answer
+
+        respond(channel_id, event["user"], text, thread_ts=thread_ts)
 
     @app.action("join_group")
     def handle_join(ack, body, client):
@@ -204,8 +231,10 @@ def register(app, converse, progress, db, token_for) -> None:
         """Whoever clicks owns the booking, on their own Swiggy account."""
         ack()
         channel_id = body["channel"]["id"]
+        from canteen.app import PROPOSALS, action_thread, conv_key
+        thread_ts = action_thread(channel_id, body["message"])
         proposal = json.loads(body["actions"][0]["value"])
-        from canteen.app import PROPOSALS
-        PROPOSALS[channel_id] = {"service": "dineout", **proposal}
-        client.chat_postMessage(channel=channel_id, text="Confirm this booking",
+        PROPOSALS[conv_key(channel_id, thread_ts)] = {"service": "dineout", **proposal}
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                text="Confirm this booking",
                                 blocks=blocks.confirm_booking(proposal))

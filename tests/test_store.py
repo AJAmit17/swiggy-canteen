@@ -105,6 +105,26 @@ def test_deleting_a_group_ends_the_flow(tmp_path):
     assert store.get_group(conn, "C1") is None
 
 
+def test_bot_thread_round_trips(tmp_path):
+    conn = fresh(tmp_path)
+    assert store.is_bot_thread(conn, "C1", "111.1") is False
+    store.mark_bot_thread(conn, "C1", "111.1", 1000.0)
+    assert store.is_bot_thread(conn, "C1", "111.1") is True
+
+
+def test_bot_thread_marking_twice_does_not_duplicate(tmp_path):
+    conn = fresh(tmp_path)
+    store.mark_bot_thread(conn, "C1", "111.1", 1000.0)
+    store.mark_bot_thread(conn, "C1", "111.1", 2000.0)
+    assert conn.execute("select count(*) from bot_thread").fetchone()[0] == 1
+
+
+def test_bot_thread_does_not_leak_across_channels(tmp_path):
+    conn = fresh(tmp_path)
+    store.mark_bot_thread(conn, "C1", "111.1", 1000.0)
+    assert store.is_bot_thread(conn, "C2", "111.1") is False
+
+
 def test_connect_hands_each_thread_its_own_connection(tmp_path):
     """Bolt runs every listener on a pool thread and sqlite3 objects cannot
     cross threads."""

@@ -57,20 +57,60 @@ def token_for(user_id: str) -> str:
     return auth.valid_token(db(), http, user_id, time.time())
 
 
+_bot_user_id: str | None = None
+
+
+def bot_user_id(client) -> str:
+    """The bot's own user id, fetched once and cached.
+
+    Slack delivers a message that mentions us as *both* an `app_mention` event
+    and this plain `message` event — this lets the message handler recognise
+    and skip the ones app_mention already handled.
+    """
+    global _bot_user_id
+    if _bot_user_id is None:
+        _bot_user_id = client.auth_test()["user_id"]
+    return _bot_user_id
+
+
+def action_thread(channel_id: str, message: dict) -> str | None:
+    """The thread a button click's reply belongs in, or None for a DM (which
+    never threads its own replies — see conv_key).
+
+    Slack only adds `thread_ts` to a root message once something has actually
+    replied to it — until then it's absent even though the message *is* the
+    root. `thread_ts or its own ts` is correct either way, so this must never
+    be read as a bare `message.get("thread_ts")`.
+    """
+    if channel_id.startswith("D"):
+        return None
+    return message.get("thread_ts") or message["ts"]
+
+
+def conv_key(channel_id: str, thread_ts: str | None) -> str:
+    """The key conversation state (history, a pending proposal) is filed
+    under. A DM channel id always starts with 'D' (a stable Slack convention)
+    and is one continuous conversation regardless of Slack's own thread
+    nesting — every DM turn posts a fresh top-level message, so keying by
+    thread there would fragment history every turn. A channel can run several
+    independent threads at once, so those get their own key each."""
+    if channel_id.startswith("D") or not thread_ts:
+        return channel_id
+    return f"{channel_id}:{thread_ts}"
+
+
 # ------------------------------------------------------------- local tools
 
-def _propose_purchase(channel_id: str, service: str, total: int,
-                      summary: str) -> str:
+def _propose_purchase(key: str, service: str, total: int, summary: str) -> str:
     blocked = agent.blocked_reason(service, total)
     if blocked:
         return f"Not offering that yet: {blocked}"
-    PROPOSALS[channel_id] = {"service": service, "total": total,
-                             "summary": summary}
+    PROPOSALS[key] = {"service": service, "total": total, "summary": summary}
     return "A confirm button has been shown to the user. Stop and wait."
 
 
-def _propose_booking(channel_id: str, **proposal) -> str:
-    PROPOSALS[channel_id] = {"service": "dineout", **proposal}
+def _propose_booking(key: str, **proposal) -> str:
+    PROPOSALS[key] = {"service": "dineout", **proposal}
     return "A confirm button has been shown to the user. Stop and wait."
 
 
@@ -79,12 +119,12 @@ def _remember_preference(user_id: str, note: str) -> str:
     return "Saved."
 
 
-def local_ctx(user_id: str, channel_id: str) -> dict:
-    """The local tools the model may call, bound to this person and channel."""
+def local_ctx(user_id: str, key: str) -> dict:
+    """The local tools the model may call, bound to this person and conversation."""
     return {
         "propose_purchase": lambda service, total, summary: _propose_purchase(
-            channel_id, service, total, summary),
-        "propose_booking": lambda **kw: _propose_booking(channel_id, **kw),
+            key, service, total, summary),
+        "propose_booking": lambda **kw: _propose_booking(key, **kw),
         "remember_preference": lambda note: _remember_preference(user_id, note),
     }
 
@@ -92,12 +132,15 @@ def local_ctx(user_id: str, channel_id: str) -> dict:
 # ------------------------------------------------------------ model access
 
 def converse(channel_id: str, user_id: str, prompt: str, servers: list[str],
-             extra_system: str | None = None, allow_spend: bool = False) -> str:
-    """One turn of conversation, continuing whatever came before in this channel.
+             extra_system: str | None = None, allow_spend: bool = False,
+             thread_ts: str | None = None) -> str:
+    """One turn of conversation, continuing whatever came before in this
+    channel (or, inside a channel, this specific thread).
 
     allow_spend is what actually unlocks the money tools, and only a button
     handler passes it.
     """
+    key = conv_key(channel_id, thread_ts)
     instruction = extra_system or agent.system_for(
         store.get_preference(db(), user_id))
     reply, messages = agent.run(
@@ -105,38 +148,44 @@ def converse(channel_id: str, user_id: str, prompt: str, servers: list[str],
         prompt=prompt,
         token=token_for(user_id),
         servers=servers,
-        ctx=local_ctx(user_id, channel_id),
+        ctx=local_ctx(user_id, key),
         extra_system=instruction,
         allow_spend=allow_spend,
-        history=store.get_history(db(), channel_id),
+        history=store.get_history(db(), key),
     )
-    store.set_history(db(), channel_id, messages, time.time())
+    store.set_history(db(), key, messages, time.time())
     return to_mrkdwn(reply)
 
 
 def progress(channel_id: str, thread_ts: str | None = None):
-    """Post a placeholder now; return a function that turns it into the answer.
+    """Post a placeholder now; return a function that turns it into the answer,
+    plus the thread root this turn's conversation state should be filed under.
 
     A Swiggy round trip takes ten to thirty seconds and Slack shows nothing at
     all meanwhile — the channel just looks broken.
     """
     posted = app.client.chat_postMessage(channel=channel_id, text=THINKING,
                                          thread_ts=thread_ts)
+    # Whatever we just posted becomes a thread others can reply into without
+    # re-mentioning us — a fresh top-level post is its own future thread root.
+    root_ts = thread_ts or posted["ts"]
+    store.mark_bot_thread(db(), channel_id, root_ts, time.time())
 
     def finish(text: str, block_kit: list | None = None) -> None:
         app.client.chat_update(channel=channel_id, ts=posted["ts"], text=text,
                                blocks=block_kit or [])
 
-    return finish
+    return finish, root_ts
 
 
 def respond(channel_id: str, user_id: str, prompt: str,
             servers: list[str] | None = None,
             thread_ts: str | None = None) -> None:
     """Converse, showing progress, and render any proposal the model produced."""
-    finish = progress(channel_id, thread_ts)
+    finish, root_ts = progress(channel_id, thread_ts)
     try:
-        reply = converse(channel_id, user_id, prompt, servers or SERVERS_ALL)
+        reply = converse(channel_id, user_id, prompt, servers or SERVERS_ALL,
+                         thread_ts=root_ts)
     except auth.NotConnected:
         finish("Connect your Swiggy account first.",
                blocks.connect_prompt(auth.begin_link(db(), user_id, time.time())))
@@ -146,7 +195,7 @@ def respond(channel_id: str, user_id: str, prompt: str,
         finish(f":warning: That didn't work: `{exc}`. Nothing was ordered.")
         return
 
-    proposal = PROPOSALS.get(channel_id)
+    proposal = PROPOSALS.get(conv_key(channel_id, root_ts))
     if not proposal:
         finish(reply)
         return
@@ -212,7 +261,8 @@ def handle_dm(body, client):
 def handle_cancel_purchase(ack, body, client):
     ack()
     channel_id = body["channel"]["id"]
-    PROPOSALS.pop(channel_id, None)
+    thread_ts = action_thread(channel_id, body["message"])
+    PROPOSALS.pop(conv_key(channel_id, thread_ts), None)
     client.chat_update(channel=channel_id, ts=body["message"]["ts"],
                        text="Cancelled. Nothing was ordered.", blocks=[])
 
@@ -223,7 +273,8 @@ def handle_confirm_purchase(ack, body, client):
     ack()
     channel_id = body["channel"]["id"]
     user_id = body["user"]["id"]
-    proposal = PROPOSALS.pop(channel_id, None)
+    thread_ts = action_thread(channel_id, body["message"])
+    proposal = PROPOSALS.pop(conv_key(channel_id, thread_ts), None)
     if not proposal:
         client.chat_update(channel=channel_id, ts=body["message"]["ts"], blocks=[],
                            text="That order expired — ask me again.")
@@ -245,6 +296,7 @@ def handle_confirm_purchase(ack, body, client):
             extra_system=agent.system_for(store.get_preference(db(), user_id))
             + "\n" + agent.AUTHORISED,
             allow_spend=True,
+            thread_ts=thread_ts,
         )
     except Exception as exc:
         log.exception("order failed")
@@ -254,14 +306,14 @@ def handle_confirm_purchase(ack, body, client):
             channel_id, user_id,
             f"Call {recent} and report my most recent order and its status. "
             "Do not order anything.",
-            servers=servers)
+            servers=servers, thread_ts=thread_ts)
         client.chat_postMessage(
-            channel=channel_id,
+            channel=channel_id, thread_ts=thread_ts,
             text=(f"The order call failed (`{exc}`). I did *not* retry — that "
                   f"risks ordering twice. Latest on your account:\n{status}"))
         return
 
-    client.chat_postMessage(channel=channel_id, text=reply)
+    client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=reply)
 
 
 @app.action("confirm_booking")
@@ -270,7 +322,8 @@ def handle_confirm_booking(ack, body, client):
     ack()
     channel_id = body["channel"]["id"]
     user_id = body["user"]["id"]
-    proposal = PROPOSALS.pop(channel_id, None)
+    thread_ts = action_thread(channel_id, body["message"])
+    proposal = PROPOSALS.pop(conv_key(channel_id, thread_ts), None)
     if not proposal:
         client.chat_update(channel=channel_id, ts=body["message"]["ts"], blocks=[],
                            text="That booking expired — ask me again.")
@@ -288,6 +341,7 @@ def handle_confirm_booking(ack, body, client):
             extra_system=agent.system_for(store.get_preference(db(), user_id))
             + "\n" + agent.AUTHORISED,
             allow_spend=True,
+            thread_ts=thread_ts,
         )
     except Exception as exc:
         log.exception("booking failed")
@@ -296,14 +350,14 @@ def handle_confirm_booking(ack, body, client):
             f"Check get_booking_status for restaurant "
             f"{proposal['restaurant_id']} slot {proposal['slot_id']} and report "
             "what you find. Do not book anything.",
-            servers=["dineout"])
+            servers=["dineout"], thread_ts=thread_ts)
         client.chat_postMessage(
-            channel=channel_id,
+            channel=channel_id, thread_ts=thread_ts,
             text=(f"The booking call failed (`{exc}`). I did *not* retry. "
                   f"What Swiggy shows:\n{status}"))
         return
 
-    client.chat_postMessage(channel=channel_id, text=reply)
+    client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=reply)
 
 
 # ------------------------------------------------------------------ errors

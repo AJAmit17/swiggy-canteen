@@ -48,6 +48,12 @@ create table if not exists group_order (
     context text not null,
     created_at real not null
 );
+create table if not exists bot_thread (
+    channel_id text not null,
+    thread_ts text not null,
+    updated_at real not null,
+    primary key (channel_id, thread_ts)
+);
 """
 
 
@@ -195,3 +201,27 @@ def set_group_context(conn, channel_id: str, context: dict) -> None:
 def delete_group(conn, channel_id: str) -> None:
     conn.execute("delete from group_order where channel_id = ?", (channel_id,))
     conn.commit()
+
+
+# --- bot-started threads ---
+#
+# Channels only ever tell us about a plain mention (app_mention); a thread
+# reply with no @mention in it arrives as a generic message event. To let
+# people keep talking without re-mentioning every turn, we remember which
+# threads the assistant itself is already part of and only auto-continue those.
+
+def mark_bot_thread(conn, channel_id: str, thread_ts: str, updated_at: float) -> None:
+    conn.execute(
+        "insert into bot_thread (channel_id, thread_ts, updated_at) "
+        "values (?, ?, ?) on conflict(channel_id, thread_ts) do update set "
+        "updated_at=excluded.updated_at",
+        (channel_id, thread_ts, updated_at),
+    )
+    conn.commit()
+
+
+def is_bot_thread(conn, channel_id: str, thread_ts: str) -> bool:
+    row = conn.execute(
+        "select 1 from bot_thread where channel_id = ? and thread_ts = ?",
+        (channel_id, thread_ts)).fetchone()
+    return row is not None

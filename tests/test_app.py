@@ -116,3 +116,31 @@ def test_an_unconnected_person_gets_NotConnected_rather_than_a_crash():
     import pytest
     with pytest.raises(auth.NotConnected):
         app.token_for("U-NOBODY")
+
+
+def test_conv_key_is_bare_channel_id_for_a_dm_even_with_a_thread_ts():
+    """DM channel ids start with 'D'; every DM turn posts a fresh top-level
+    message, so keying by thread there would fragment history every turn."""
+    assert app.conv_key("D-TEST", "111.1") == "D-TEST"
+    assert app.conv_key("D-TEST", None) == "D-TEST"
+
+
+def test_conv_key_scopes_a_channel_conversation_by_thread():
+    assert app.conv_key("C-TEST", "111.1") == "C-TEST:111.1"
+    assert app.conv_key("C-TEST", None) == "C-TEST"
+
+
+def test_action_thread_is_none_for_a_dm_regardless_of_the_message():
+    assert app.action_thread("D-TEST", {"ts": "1.1"}) is None
+    assert app.action_thread("D-TEST", {"ts": "1.1", "thread_ts": "1.1"}) is None
+
+
+def test_action_thread_resolves_a_channel_reply_from_its_thread_ts():
+    assert app.action_thread("C-TEST", {"ts": "2.2", "thread_ts": "1.1"}) == "1.1"
+
+
+def test_action_thread_falls_back_to_the_messages_own_ts_for_a_fresh_root():
+    """A thread root has no thread_ts field until something has replied to
+    it — the click can happen before that, so falling back to its own ts is
+    the only way to recover the same key `progress()` filed things under."""
+    assert app.action_thread("C-TEST", {"ts": "1.1"}) == "1.1"
